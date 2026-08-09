@@ -17,6 +17,7 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
+use super::ShareMode;
 use crate::{
     host::{
         emit_error, equilibrium::fill_equilibrium, latch::Latch, try_emit_error, ErrorCallbackArc,
@@ -306,6 +307,8 @@ pub struct StreamInner {
     pub config: StreamConfig,
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
+    // The share mode the endpoint was opened in. Governs how the buffer is serviced.
+    pub share_mode: ShareMode,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
 }
@@ -599,6 +602,13 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
 // Get the number of available frames that are available for writing/reading.
 #[inline]
 fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
+    // An event-driven exclusive-mode stream is handed one whole buffer per event, and
+    // `GetCurrentPadding` carries no useful information there — it reports the full buffer, so
+    // the shared-mode subtraction would yield zero on every pass and nothing would ever be
+    // written.
+    if stream.share_mode == ShareMode::Exclusive {
+        return Ok(stream.max_frames_in_buffer);
+    }
     unsafe {
         let padding = stream
             .audio_client
@@ -783,10 +793,16 @@ fn process_input(
         let mut buffer: *mut u8 = ptr::null_mut();
         let mut flags = mem::MaybeUninit::uninit();
         loop {
-            let mut frames_available = match capture_client.GetNextPacketSize() {
-                Ok(0) => return Ok(()),
-                Ok(f) => f,
-                Err(err) => return Err(Error::from(err)),
+            let mut frames_available = match stream.share_mode {
+                ShareMode::Shared => match capture_client.GetNextPacketSize() {
+                    Ok(0) => return Ok(()),
+                    Ok(f) => f,
+                    Err(err) => return Err(Error::from(err)),
+                },
+                // `GetNextPacketSize` is documented as working with shared-mode streams only.
+                // An event-driven exclusive-mode stream is handed one whole buffer per event, and
+                // `GetBuffer` overwrites this with the real length in any case.
+                ShareMode::Exclusive => stream.max_frames_in_buffer,
             };
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
@@ -800,7 +816,12 @@ fn process_input(
 
             match result {
                 // TODO: Can this happen?
-                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
+                // Exclusive mode services one buffer per event, so there is nothing to loop
+                // back for; retrying here would spin.
+                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => match stream.share_mode {
+                    ShareMode::Shared => continue,
+                    ShareMode::Exclusive => return Ok(()),
+                },
                 Err(e) => return Err(Error::from(e)),
                 Ok(_) => (),
             }
@@ -830,6 +851,12 @@ fn process_input(
             capture_client
                 .ReleaseBuffer(frames_available)
                 .context("Failed to release capture buffer")?;
+
+            // Shared mode drains every packet queued for this event; exclusive mode has exactly
+            // one buffer per event and no packet queue to drain.
+            if stream.share_mode == ShareMode::Exclusive {
+                return Ok(());
+            }
         }
     }
 }

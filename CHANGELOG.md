@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CoreAudio**: Xruns are now reported as `ErrorKind::Xrun`.
 - **PipeWire**: Xruns are now reported as `ErrorKind::Xrun`.
 - **WASAPI**: Capture xruns are now reported as `ErrorKind::Xrun`.
+- **WASAPI**: Exclusive-mode streams, requested through the `WasapiDeviceExt` extension trait and
+  `WasapiStreamOptions`. Share mode stays out of the cross-platform `StreamConfig`; callers that do
+  not ask for it get unchanged shared-mode behaviour.
 
 ### Changed
 
