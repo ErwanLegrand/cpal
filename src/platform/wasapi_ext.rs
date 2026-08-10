@@ -40,13 +40,18 @@
 //! When there is no WASAPI endpoint behind the device — a non-Windows build, or a Windows build
 //! using another host such as ASIO or JACK — the methods behave as follows:
 //!
-//! - The configuration queries answer exactly as their [`DeviceTrait`] counterparts do. Share
-//!   mode does not apply to such a device, so it is ignored rather than treated as an error.
-//! - The stream builders accept [`ShareMode::Shared`], since that is what an ordinary stream
-//!   already is, and reject [`ShareMode::Exclusive`] with
-//!   [`ErrorKind::UnsupportedOperation`](crate::ErrorKind::UnsupportedOperation). A request for
-//!   exclusive mode is never quietly downgraded to a shared stream; whether to fall back is the
-//!   caller's decision to make.
+//! - Under [`ShareMode::Shared`], every method behaves exactly as its [`DeviceTrait`] counterpart
+//!   does — that is what an ordinary stream already is.
+//! - Under [`ShareMode::Exclusive`], every method — the configuration queries as well as the
+//!   stream builders — fails with
+//!   [`ErrorKind::UnsupportedOperation`](crate::ErrorKind::UnsupportedOperation).
+//!
+//! The queries refuse rather than answering for shared mode, and that is deliberate. These
+//! queries are how a caller asks "is exclusive mode available on this device?"; answering with a
+//! successful shared-mode configuration reads as a yes, and the caller only learns otherwise at
+//! build time — possibly after it has already told a user which mode it is in. A request for
+//! exclusive mode is never quietly downgraded, at any entry point; whether to fall back to shared
+//! is the caller's decision to make, and it needs an honest answer in order to make it.
 //!
 //! [`StreamConfig`]: crate::StreamConfig
 //! [`DeviceTrait`]: crate::traits::DeviceTrait
@@ -309,8 +314,15 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.default_input_config_with(options);
         }
-        // Not a WASAPI endpoint: it has exactly one mode, so answer for that one.
-        let _ = options;
+        // Not a WASAPI endpoint, so exclusive mode does not exist here and is refused rather
+        // than answered for. Falling through to the shared-mode answer would be a quiet
+        // downgrade in the one place it does the most damage: a caller probing "is exclusive
+        // available on this device?" through this query would read a successful shared-mode
+        // config as a yes, and only discover otherwise at build time -- by which point it may
+        // already have told a user which mode it is in.
+        if options.share_mode != ShareMode::Shared {
+            return Err(exclusive_unsupported());
+        }
         DeviceTrait::default_input_config(self)
     }
 
@@ -322,7 +334,9 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.default_output_config_with(options);
         }
-        let _ = options;
+        if options.share_mode != ShareMode::Shared {
+            return Err(exclusive_unsupported());
+        }
         DeviceTrait::default_output_config(self)
     }
 
@@ -334,7 +348,9 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.supported_input_configs_with(options);
         }
-        let _ = options;
+        if options.share_mode != ShareMode::Shared {
+            return Err(exclusive_unsupported());
+        }
         // Every backend's own iterator is already a `Vec` walk; collecting keeps this trait's
         // return type the same one the WASAPI backend hands back.
         Ok(DeviceTrait::supported_input_configs(self)?
@@ -350,7 +366,9 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.supported_output_configs_with(options);
         }
-        let _ = options;
+        if options.share_mode != ShareMode::Shared {
+            return Err(exclusive_unsupported());
+        }
         Ok(DeviceTrait::supported_output_configs(self)?
             .collect::<Vec<_>>()
             .into_iter())
