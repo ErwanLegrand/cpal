@@ -35,9 +35,11 @@ pub use crate::host::pipewire::Host as PipeWireHost;
 #[cfg(feature = "custom")]
 pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
 
-/// WASAPI-specific extensions. See [`WasapiDeviceExt`] for how share mode is requested.
-#[cfg(target_os = "windows")]
-pub use crate::host::wasapi::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
+pub mod wasapi_ext;
+
+// Unconditional on purpose: saying "exclusive mode where this platform has it" should not cost
+// the caller a conditional-compilation attribute. See `wasapi_ext`'s own documentation.
+pub use wasapi_ext::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
 
 /// A macro to assist with implementing a platform's dynamically dispatched [`Host`] type.
 ///
