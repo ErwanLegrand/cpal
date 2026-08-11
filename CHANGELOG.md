@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StreamTrait::stop` ends a stream gracefully, draining buffered audio before halting (blocking up to a caller-supplied timeout). Dropping a stream still halts immediately without draining.
 - `CallbackInfo::xrun()` reports buffer over/underruns via the data callback.
 - **AudioWorklet**: Input streams are now supported.
+- **WASAPI**: Exclusive-mode streams, requested through the `WasapiDeviceExt` extension trait and
+  `WasapiStreamOptions`. Share mode stays out of the cross-platform `StreamConfig`; callers that do
+  not ask for it get unchanged shared-mode behaviour.
 - **WebAudio**: Input streams are now supported.
 
 ### Changed
@@ -40,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+- **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
 - **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
   hands the packet back to WASAPI on the capture error paths that used to leak it.
 - **WASAPI**: The shift that left-justifies a sample in a wider container is read off the

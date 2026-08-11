@@ -14,14 +14,12 @@ pub use self::device::{
     Device, Devices, SupportedInputConfigs, SupportedOutputConfigs, default_input_device,
     default_output_device,
 };
-#[expect(
-    unused_imports,
-    reason = "re-exported for public API via platform module"
-)]
+pub use self::ext::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
 pub use self::stream::Stream;
 use crate::{Error, ErrorKind, traits::HostTrait};
 
 mod device;
+mod ext;
 mod stream;
 
 /// The WASAPI host, the default windows host type.
