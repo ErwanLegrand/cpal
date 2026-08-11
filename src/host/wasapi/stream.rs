@@ -17,6 +17,7 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
+use super::container_align;
 use crate::{
     host::{
         emit_error, equilibrium::fill_equilibrium, latch::Latch, try_emit_error, ErrorCallbackArc,
@@ -308,6 +309,12 @@ pub struct StreamInner {
     pub sample_format: SampleFormat,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
+    // Bits the samples must move up to sit left-justified in the negotiated container, as the
+    // device reads them. Zero for every format whose container is exactly full.
+    pub container_shift: u32,
+    // Capture staging buffer for a non-zero `container_shift`, allocated at stream build. Empty
+    // for render, and for capture with nothing to shift.
+    pub capture_scratch: Vec<i32>,
 }
 
 impl Stream {
@@ -632,7 +639,7 @@ fn run_input(
             _ => unreachable!(),
         };
         if let Err(err) = process_input(
-            &run_ctxt.stream,
+            &mut run_ctxt.stream,
             capture_client,
             data_callback,
             error_callback,
@@ -773,7 +780,7 @@ fn process_commands_and_await_signal(
 
 // The loop for processing pending input data.
 fn process_input(
-    stream: &StreamInner,
+    stream: &mut StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
     error_callback: &ErrorCallbackArc,
@@ -816,14 +823,33 @@ fn process_input(
 
             debug_assert!(!buffer.is_null());
 
-            let data = buffer as *mut ();
-            let len = frames_available as usize * stream.bytes_per_frame as usize
-                / stream.sample_format.sample_size();
-            let data = Data::from_parts(data, len, stream.sample_format);
+            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+            let len = byte_count / stream.sample_format.sample_size();
 
             // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
             let timestamp = input_timestamp(stream, qpc_position)?;
             let info = InputCallbackInfo { timestamp };
+
+            // WASAPI lends this buffer to be read, so samples arriving left-justified in a wider
+            // container are staged through `capture_scratch` rather than shifted where they lie.
+            // The staging buffer was sized to the endpoint buffer at stream build, so the resize
+            // is a safeguard against a packet larger than WASAPI says it can hand over.
+            let data = if stream.container_shift == 0 {
+                buffer as *mut ()
+            } else {
+                // Only a four-byte container is ever shifted, so one container is one sample.
+                debug_assert_eq!(stream.sample_format.sample_size(), mem::size_of::<i32>());
+                if len > stream.capture_scratch.len() {
+                    stream.capture_scratch.resize(len, 0);
+                }
+                let scratch = &mut stream.capture_scratch[..len];
+                // SAFETY: `buffer` is WASAPI's packet, valid for `byte_count` bytes until the
+                // `ReleaseBuffer` below, and a separate allocation from the staging buffer.
+                let packet = std::slice::from_raw_parts(buffer, byte_count);
+                container_align::right_align_into(packet, scratch, stream.container_shift);
+                scratch.as_mut_ptr() as *mut ()
+            };
+            let data = Data::from_parts(data, len, stream.sample_format);
             data_callback(&data, &info);
 
             // Release the buffer.
@@ -854,8 +880,13 @@ fn process_output(
         debug_assert!(!buffer.is_null());
 
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, stream.sample_format);
+        // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
+        // `ReleaseBuffer` below. Not bound to a name, so it does not overlap the slice taken
+        // after the callback.
+        fill_equilibrium(
+            std::slice::from_raw_parts_mut(buffer, byte_count),
+            stream.sample_format,
+        );
 
         let data = buffer as *mut ();
         let len = byte_count / stream.sample_format.sample_size();
@@ -864,6 +895,16 @@ fn process_output(
         let timestamp = output_timestamp(stream, sample_rate, clock_frequency, *frames_written)?;
         let info = OutputCallbackInfo { timestamp };
         data_callback(&mut data, &info);
+
+        // The callback wrote CPAL's right-aligned samples; the device reads the container as
+        // left-justified. Move them up after the callback and before `ReleaseBuffer`, which is
+        // where WASAPI takes the bytes.
+        if stream.container_shift != 0 {
+            // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
+            // `ReleaseBuffer` below; `data` is not read again.
+            let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
+            container_align::left_justify(buffer_slice, stream.container_shift);
+        }
 
         render_client.ReleaseBuffer(frames_available, 0)?;
 

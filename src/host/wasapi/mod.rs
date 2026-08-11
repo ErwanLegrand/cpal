@@ -15,6 +15,7 @@ pub use self::device::{
 pub use self::stream::Stream;
 use crate::{traits::HostTrait, Error, ErrorKind};
 
+mod container_align;
 mod device;
 mod stream;
 
