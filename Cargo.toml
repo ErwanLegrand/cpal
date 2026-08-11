@@ -231,6 +231,9 @@ name = "synth_tones"
 name = "custom"
 required-features = ["custom"]
 
+[[example]]
+name = "wasapi_exclusive_probe"
+
 [package.metadata.docs.rs]
 # The docs.rs build environment does not have all the dependencies for all features
 features = [

@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: Exclusive-mode streams, requested through the `WasapiDeviceExt` extension trait and
   `WasapiStreamOptions`. Share mode stays out of the cross-platform `StreamConfig`; callers that do
   not ask for it get unchanged shared-mode behaviour.
+- **WASAPI**: `wasapi_exclusive_probe` example, which reports per endpoint *why* exclusive mode is
+  refused: the decoded mix format, both device periods, and an `IsFormatSupported` matrix over
+  sample rate x sample format x `dwChannelMask`, including layouts CPAL cannot itself emit.
 
 ### Changed
 
