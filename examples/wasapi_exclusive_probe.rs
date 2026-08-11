@@ -9,11 +9,12 @@
 //! Two shapes in particular are things `cpal` cannot currently express, and both look identical to
 //! "this device has no exclusive mode" from the outside:
 //!
-//! - **A positional channel mask.** `config_to_waveformatextensible` hard-codes
-//!   `dwChannelMask = KSAUDIO_SPEAKER_DIRECTOUT`, which is 0. In shared mode the Windows audio
-//!   engine accepts that; in exclusive mode the format goes to the driver directly, and a driver
-//!   that wants real speaker positions answers `AUDCLNT_E_UNSUPPORTED_FORMAT` to a zero mask while
-//!   accepting the identical format with `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT`.
+//! - **A positional channel mask.** In shared mode the Windows audio engine accepts
+//!   `dwChannelMask = KSAUDIO_SPEAKER_DIRECTOUT` (0); in exclusive mode the format goes to the
+//!   driver directly, and a driver that wants real speaker positions answers
+//!   `AUDCLNT_E_UNSUPPORTED_FORMAT` to a zero mask while accepting the identical format with
+//!   `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT`. `config_to_waveformatextensible` sent 0 for every
+//!   format until `channel_mask_for` was added; it now sends a positional mask in exclusive mode.
 //! - **Packed 24-bit.** `SampleFormat::I24` is 24 valid bits in a *4-byte* container, and
 //!   `config_to_waveformatextensible` can emit nothing else. An endpoint that wants
 //!   `wBitsPerSample = 24` with a 3-byte frame per channel is never offered it.
@@ -117,11 +118,20 @@ mod windows_probe {
         }
     }
 
-    /// The channel mask `cpal` sends: `config_to_waveformatextensible`
-    /// (`src/host/wasapi/device.rs`) always uses `KSAUDIO_SPEAKER_DIRECTOUT`, which is 0.
-    const CPAL_CHANNEL_MASK: u32 = KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT;
+    /// The channel mask `cpal` sends in **exclusive** mode, mirroring `channel_mask_for`
+    /// (`src/host/wasapi/device.rs`) for the two-channel case.
+    ///
+    /// This is a hand-kept copy, and that is a real hazard worth stating: this example builds
+    /// every `WAVEFORMATEXTENSIBLE` itself and never calls `config_to_waveformatextensible`, so
+    /// nothing makes the two agree. An earlier revision of this file hard-coded
+    /// `KSAUDIO_SPEAKER_DIRECTOUT` and kept printing "cpal sends 0, this is a cpal bug" for two
+    /// commits after that bug was fixed. **If `channel_mask_for` changes, change this too** — and
+    /// note that a run of this example can never, by construction, verify what the library does.
+    /// Use `list_devices` in the consuming application for that.
+    const CPAL_CHANNEL_MASK: u32 =
+        KernelStreaming::SPEAKER_FRONT_LEFT | KernelStreaming::SPEAKER_FRONT_RIGHT;
 
-    const _: () = assert!(CPAL_CHANNEL_MASK == 0);
+    const _: () = assert!(CPAL_CHANNEL_MASK == 0x3);
 
     /// One row of the exclusive-mode format matrix.
     struct Candidate {
@@ -1287,10 +1297,13 @@ mod windows_probe {
         let mask_sentence = flips.first().map(|flip| {
             format!(
                 "{} @ {} Hz, {} ch is ACCEPTED WITH A POSITIONAL MASK ({:#010X}) AND REFUSED WITH \
-                 0 (which answered {}); {} cell(s) behave that way. cpal's \
-                 config_to_waveformatextensible hard-codes dwChannelMask = \
-                 KSAUDIO_SPEAKER_DIRECTOUT, so this is a bug in cpal's exclusive-mode path, not a \
-                 device limitation.",
+                 0 (which answered {}); {} cell(s) behave that way. This endpoint requires a \
+                 positional dwChannelMask in exclusive mode -- a device fact, measured here. \
+                 cpal sends one as of the commit that added channel_mask_for; a cpal older than \
+                 that sent KSAUDIO_SPEAKER_DIRECTOUT (0) and could not reach these formats at all. \
+                 This example builds its own formats and never calls the library, so it cannot \
+                 tell you which of the two you are running -- check that from the consuming \
+                 application.",
                 flip.candidate.label,
                 flip.rate,
                 flip.channels,
