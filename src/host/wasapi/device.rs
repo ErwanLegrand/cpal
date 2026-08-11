@@ -744,6 +744,7 @@ impl Device {
                             buffer_size: BufferSize::Default,
                         },
                         sample_format,
+                        share_mode,
                     ) {
                         let usable = assume_convertible
                             || is_format_supported(
@@ -998,12 +999,14 @@ impl Device {
 
             // Computing the format and initializing the device.
             let (format_attempt, container_shift) =
-                config_to_waveformatextensible(config, sample_format).ok_or_else(|| {
-                    Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        "Stream configuration could not be converted to a compatible format",
-                    )
-                })?;
+                config_to_waveformatextensible(config, sample_format, share_mode).ok_or_else(
+                    || {
+                        Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            "Stream configuration could not be converted to a compatible format",
+                        )
+                    },
+                )?;
 
             // Finally, initializing the audio client
             let audio_client = self.initialize_audio_client(
@@ -1133,12 +1136,14 @@ impl Device {
 
             // Computing the format and initializing the device.
             let (format_attempt, container_shift) =
-                config_to_waveformatextensible(config, sample_format).ok_or_else(|| {
-                    Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        "Stream configuration could not be converted to a compatible format",
-                    )
-                })?;
+                config_to_waveformatextensible(config, sample_format, share_mode).ok_or_else(
+                    || {
+                        Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            "Stream configuration could not be converted to a compatible format",
+                        )
+                    },
+                )?;
 
             // Finally, initializing the audio client
             let audio_client = self.initialize_audio_client(
@@ -1604,6 +1609,64 @@ const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 7] = [
     SampleFormat::F64,
 ];
 
+// Standard speaker layouts, as documented for `KSAUDIO_CHANNEL_CONFIG`. The `windows` crate
+// exports the individual `SPEAKER_*` bits but not these combinations, so they are spelled out.
+//
+// Four and six channels each have a second documented layout (`KSAUDIO_SPEAKER_SURROUND` 0x107 and
+// `KSAUDIO_SPEAKER_5POINT1_SURROUND` 0x60F); the ones picked here are the two that nest inside the
+// eight-channel layout below. Eight channels is deliberately not `KSAUDIO_SPEAKER_7POINT1` (0xFF),
+// which the same page calls obsolete and no longer supported.
+const KSAUDIO_SPEAKER_MONO: u32 = KernelStreaming::SPEAKER_FRONT_CENTER;
+const KSAUDIO_SPEAKER_STEREO: u32 =
+    KernelStreaming::SPEAKER_FRONT_LEFT | KernelStreaming::SPEAKER_FRONT_RIGHT;
+const KSAUDIO_SPEAKER_QUAD: u32 = KSAUDIO_SPEAKER_STEREO
+    | KernelStreaming::SPEAKER_BACK_LEFT
+    | KernelStreaming::SPEAKER_BACK_RIGHT;
+const KSAUDIO_SPEAKER_5POINT1: u32 = KSAUDIO_SPEAKER_QUAD
+    | KernelStreaming::SPEAKER_FRONT_CENTER
+    | KernelStreaming::SPEAKER_LOW_FREQUENCY;
+const KSAUDIO_SPEAKER_7POINT1_SURROUND: u32 = KSAUDIO_SPEAKER_5POINT1
+    | KernelStreaming::SPEAKER_SIDE_LEFT
+    | KernelStreaming::SPEAKER_SIDE_RIGHT;
+
+// The `dwChannelMask` to advertise for `share_mode`.
+//
+// Shared mode keeps `KSAUDIO_SPEAKER_DIRECTOUT` (0), which this backend has always sent: the
+// audio engine accepts it and cpal does not care about speaker positions.
+//
+// Exclusive mode cannot keep it. The format goes to the driver rather than to the engine, and a
+// driver may reject a zero mask with `AUDCLNT_E_UNSUPPORTED_FORMAT`, indistinguishable from "this
+// endpoint has no exclusive mode at all". Measured on a PreSonus AudioBox 22VSL (USB, Windows 11):
+// 24-bit-in-a-32-bit-container at 48 kHz stereo is refused with mask 0 and accepted with
+// `SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT`, every other field identical.
+//
+// Only documented layouts are emitted. Any other width falls back to `KSAUDIO_SPEAKER_DIRECTOUT`,
+// documented as rendering the first channel to the first port on the device and so on, which is
+// the truthful answer when there is no positional layout to name; inventing one risks a mask with
+// reserved bits, which is refused for a reason that has nothing to do with the device.
+//
+// The same mask must be used when probing and when initializing, or a format that
+// `IsFormatSupported` approved fails at `Initialize`. Both paths reach it through here.
+//
+// U8 and I16 go out as a plain `WAVE_FORMAT_PCM` header, whose `cbSize` of 0 stops the driver
+// reading as far as `dwChannelMask`, so for those two the mask computed here never leaves the
+// process. Spelling them `WAVE_FORMAT_EXTENSIBLE` instead would carry it, but Device Formats
+// warns that a driver may accept one spelling and refuse the other, so that trade is not made
+// blind.
+fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
+    match share_mode {
+        ShareMode::Shared => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+        ShareMode::Exclusive => match channels {
+            1 => KSAUDIO_SPEAKER_MONO,
+            2 => KSAUDIO_SPEAKER_STEREO,
+            4 => KSAUDIO_SPEAKER_QUAD,
+            6 => KSAUDIO_SPEAKER_5POINT1,
+            8 => KSAUDIO_SPEAKER_7POINT1_SURROUND,
+            _ => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+        },
+    }
+}
+
 // Turns a `Format` into a `WAVEFORMATEXTENSIBLE`, paired with the shift its samples need to sit
 // left-justified in the container it declares.
 //
@@ -1612,6 +1675,7 @@ const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 7] = [
 fn config_to_waveformatextensible(
     config: StreamConfig,
     sample_format: SampleFormat,
+    share_mode: ShareMode,
 ) -> Option<(Audio::WAVEFORMATEXTENSIBLE, u32)> {
     let format_tag = match sample_format {
         SampleFormat::U8 | SampleFormat::I16 => Audio::WAVE_FORMAT_PCM,
@@ -1652,8 +1716,7 @@ fn config_to_waveformatextensible(
         cbSize: cb_size,
     };
 
-    // CPAL does not care about speaker positions, so pass audio right through.
-    let channel_mask = KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT;
+    let channel_mask = channel_mask_for(share_mode, channels);
 
     let sub_format = match sample_format {
         SampleFormat::U8
@@ -1736,12 +1799,13 @@ unsafe fn exclusive_default_format(
                 buffer_size: BufferSize::Default,
             },
             sample_format,
+            ShareMode::Exclusive,
         ) else {
             continue;
         };
-        // Derived from the whole struct, not from `.Format`: `format_from_waveformatex_ptr`
-        // reads the extension bytes back through this pointer, which a borrow of the 18-byte
-        // header does not cover.
+        // Derived from the whole struct, not from `.Format`: `format_from_waveformatex_ptr` reads
+        // the extension bytes back through this pointer, which a borrow of the 18-byte header
+        // does not cover.
         let format_ptr = &waveformat as *const _ as *const Audio::WAVEFORMATEX;
         // SAFETY: `format_ptr` points at the `WAVEFORMATEXTENSIBLE` just built, which outlives
         // both calls, and `client` is the endpoint's own audio client.
@@ -1858,7 +1922,7 @@ mod tests {
             sample_rate: 48_000,
             buffer_size: BufferSize::Default,
         };
-        config_to_waveformatextensible(config, sample_format)
+        config_to_waveformatextensible(config, sample_format, ShareMode::Shared)
             .expect("a format the backend encodes")
             .1
     }
@@ -1878,6 +1942,62 @@ mod tests {
             SampleFormat::F64,
         ] {
             assert_eq!(container_shift_for(sample_format), 0, "{sample_format}");
+        }
+    }
+
+    // Every bit `WAVEFORMATEXTENSIBLE` defines, SPEAKER_FRONT_LEFT through SPEAKER_TOP_BACK_RIGHT.
+    // Anything outside is a channel location the documentation calls reserved.
+    const DEFINED_SPEAKER_POSITIONS: u32 = 0x3_FFFF;
+
+    #[test]
+    fn shared_mode_always_asks_for_directout() {
+        for channels in 0..=u16::MAX {
+            assert_eq!(
+                channel_mask_for(ShareMode::Shared, channels),
+                0,
+                "{channels}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_mode_uses_the_documented_layouts() {
+        for (channels, mask) in [
+            (1, 0x4),   // KSAUDIO_SPEAKER_MONO
+            (2, 0x3),   // KSAUDIO_SPEAKER_STEREO
+            (4, 0x33),  // KSAUDIO_SPEAKER_QUAD
+            (6, 0x3F),  // KSAUDIO_SPEAKER_5POINT1
+            (8, 0x63F), // KSAUDIO_SPEAKER_7POINT1_SURROUND
+        ] {
+            assert_eq!(
+                channel_mask_for(ShareMode::Exclusive, channels),
+                mask,
+                "{channels}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_mode_falls_back_to_directout_for_undocumented_widths() {
+        for channels in [0, 3, 5, 7, 9, 18, 19, 31, 32, 33, u16::MAX] {
+            assert_eq!(
+                channel_mask_for(ShareMode::Exclusive, channels),
+                0,
+                "{channels}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_mode_masks_are_positional_and_never_reserved() {
+        for channels in 0..=u16::MAX {
+            let mask = channel_mask_for(ShareMode::Exclusive, channels);
+            assert_eq!(mask & !DEFINED_SPEAKER_POSITIONS, 0, "{channels}");
+            // A non-zero mask must name exactly as many positions as there are channels, since
+            // the channels are interleaved in the order the set bits appear.
+            if mask != 0 {
+                assert_eq!(mask.count_ones(), u32::from(channels), "{channels}");
+            }
         }
     }
 }
