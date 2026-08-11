@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     error::ResultExt,
-    host::{com::ComString, ErrorCallbackArc},
+    host::{com::ComString, container_align, ErrorCallbackArc},
     BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceId,
     DeviceType, Error, ErrorKind, FrameCount, InputCallbackInfo, InterfaceType, OutputCallbackInfo,
     SampleFormat, SampleRate, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
@@ -1051,6 +1051,23 @@ impl Device {
                 Duration::from_nanos(hns.max(0) as u64 * 100)
             };
 
+            // A device that left-justifies its samples in a wider container hands the run loop a
+            // buffer it may only read, so the samples are moved back down into a staging buffer
+            // on their way to the data callback. Sized once, here, so the callback allocates
+            // nothing; left empty — no allocation at all — for the formats needing no shift.
+            //
+            // `i32` rather than `u8` because that buffer reaches the callback as a `Data`, and
+            // `Data::as_slice` casts its pointer to the sample type: a `Vec<u8>` promises no
+            // alignment whatsoever, and only a four-byte container is ever shifted.
+            let container_shift = container_shift(&format_attempt);
+            let capture_scratch = if container_shift == 0 {
+                Vec::new()
+            } else {
+                let containers = max_frames_in_buffer as usize * waveformatex.nBlockAlign as usize
+                    / mem::size_of::<i32>();
+                vec![0i32; containers]
+            };
+
             Ok(StreamInner {
                 audio_client,
                 audio_clock,
@@ -1064,6 +1081,8 @@ impl Device {
                 sample_format,
                 share_mode,
                 stream_latency,
+                container_shift,
+                capture_scratch,
             })
         }
     }
@@ -1181,6 +1200,10 @@ impl Device {
                 sample_format,
                 share_mode,
                 stream_latency,
+                container_shift: container_shift(&format_attempt),
+                // Render writes into WASAPI's own buffer, which is the backend's to modify until
+                // `ReleaseBuffer`, so the shift happens where the samples already are.
+                capture_scratch: Vec::new(),
             })
         }
     }
@@ -1669,6 +1692,25 @@ fn config_to_waveformatextensible(
     };
 
     Some(waveformatextensible)
+}
+
+/// How far the negotiated format's samples must move up to sit left-justified in their container.
+///
+/// Read off the `WAVEFORMATEXTENSIBLE` this backend actually hands `Initialize`, rather than off
+/// the `SampleFormat`, so the answer is whatever the format's own two bit counts say: zero for
+/// every format whose container is exactly full, without naming any of them, and non-zero only
+/// where the device was told the container holds fewer bits than it has room for.
+fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
+    // A plain `WAVE_FORMAT_PCM` header carries no extension for the device to read, so its
+    // `wValidBitsPerSample` means nothing and the container is full by definition.
+    if format.Format.cbSize == 0 {
+        return 0;
+    }
+    // SAFETY: `Samples` is a union of three `u16`s. `wValidBitsPerSample` is the member
+    // `config_to_waveformatextensible` writes, and the one `WAVE_FORMAT_EXTENSIBLE` defines for
+    // the PCM and IEEE-float subformats this backend emits.
+    let valid_bits = unsafe { format.Samples.wValidBitsPerSample };
+    container_align::padding_bits(format.Format.wBitsPerSample, valid_bits)
 }
 
 // Sample formats probed for an exclusive-mode default configuration, most precise first.
