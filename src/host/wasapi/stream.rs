@@ -17,6 +17,7 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
+use super::ShareMode;
 use crate::{
     host::{
         container_align, emit_error, equilibrium::fill_equilibrium, latch::Latch, try_emit_error,
@@ -307,6 +308,8 @@ pub struct StreamInner {
     pub config: StreamConfig,
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
+    // The share mode the endpoint was opened in. Governs how the buffer is serviced.
+    pub share_mode: ShareMode,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
     // Bits the samples must move up to sit left-justified in the negotiated container, as the
@@ -607,6 +610,13 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
 // Get the number of available frames that are available for writing/reading.
 #[inline]
 fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
+    // An event-driven exclusive-mode stream is handed one whole buffer per event, and
+    // `GetCurrentPadding` carries no useful information there — it reports the full buffer, so
+    // the shared-mode subtraction would yield zero on every pass and nothing would ever be
+    // written.
+    if stream.share_mode == ShareMode::Exclusive {
+        return Ok(stream.max_frames_in_buffer);
+    }
     unsafe {
         let padding = stream
             .audio_client
@@ -791,10 +801,16 @@ fn process_input(
         let mut buffer: *mut u8 = ptr::null_mut();
         let mut flags = mem::MaybeUninit::uninit();
         loop {
-            let mut frames_available = match capture_client.GetNextPacketSize() {
-                Ok(0) => return Ok(()),
-                Ok(f) => f,
-                Err(err) => return Err(Error::from(err)),
+            let mut frames_available = match stream.share_mode {
+                ShareMode::Shared => match capture_client.GetNextPacketSize() {
+                    Ok(0) => return Ok(()),
+                    Ok(f) => f,
+                    Err(err) => return Err(Error::from(err)),
+                },
+                // `GetNextPacketSize` is documented as working with shared-mode streams only.
+                // An event-driven exclusive-mode stream is handed one whole buffer per event, and
+                // `GetBuffer` overwrites this with the real length in any case.
+                ShareMode::Exclusive => stream.max_frames_in_buffer,
             };
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
@@ -807,10 +823,20 @@ fn process_input(
             );
 
             match result {
-                // TODO: Can this happen?
-                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
+                // Documented as exclusive-mode only and transient: no packet was available, and
+                // the consuming thread is to wait for the next processing pass rather than treat
+                // this as fatal.
+                Err(e) if e.code() == Audio::AUDCLNT_E_BUFFER_ERROR => return Ok(()),
                 Err(e) => return Err(Error::from(e)),
                 Ok(_) => (),
+            }
+
+            // `AUDCLNT_S_BUFFER_EMPTY` is a success code: an empty packet arrives here as `Ok`
+            // with a zero frame count and `buffer` left as it was, so it has to be checked for
+            // rather than matched on. Releasing a packet of size zero is optional, and nothing
+            // was read, so there is nothing to hand back.
+            if frames_available == 0 || buffer.is_null() {
+                return Ok(());
             }
 
             let flags = flags.assume_init();
@@ -821,8 +847,6 @@ fn process_input(
             {
                 let _ = try_emit_error(error_callback, ErrorKind::Xrun.into());
             }
-
-            debug_assert!(!buffer.is_null());
 
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
             let len = byte_count / stream.sample_format.sample_size();
@@ -871,6 +895,12 @@ fn process_input(
             capture_client
                 .ReleaseBuffer(frames_available)
                 .context("Failed to release capture buffer")?;
+
+            // Shared mode drains every packet queued for this event; exclusive mode has exactly
+            // one buffer per event and no packet queue to drain.
+            if stream.share_mode == ShareMode::Exclusive {
+                return Ok(());
+            }
         }
     }
 }

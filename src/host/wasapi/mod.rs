@@ -11,11 +11,13 @@ pub use self::device::{
     default_input_device, default_output_device, Device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
 };
+pub use self::ext::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
 #[allow(unused_imports)]
 pub use self::stream::Stream;
 use crate::{traits::HostTrait, Error, ErrorKind};
 
 mod device;
+mod ext;
 mod stream;
 
 /// The WASAPI host, the default windows host type.
