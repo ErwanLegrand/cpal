@@ -737,6 +737,7 @@ impl Device {
                             buffer_size: BufferSize::Default,
                         },
                         sample_format,
+                        share_mode,
                     ) {
                         let usable = assume_convertible
                             || is_format_supported(
@@ -990,8 +991,8 @@ impl Device {
             }
 
             // Computing the format and initializing the device.
-            let format_attempt =
-                config_to_waveformatextensible(config, sample_format).ok_or_else(|| {
+            let format_attempt = config_to_waveformatextensible(config, sample_format, share_mode)
+                .ok_or_else(|| {
                     Error::with_message(
                         ErrorKind::UnsupportedConfig,
                         "Stream configuration could not be converted to a compatible format",
@@ -1107,8 +1108,8 @@ impl Device {
             };
 
             // Computing the format and initializing the device.
-            let format_attempt =
-                config_to_waveformatextensible(config, sample_format).ok_or_else(|| {
+            let format_attempt = config_to_waveformatextensible(config, sample_format, share_mode)
+                .ok_or_else(|| {
                     Error::with_message(
                         ErrorKind::UnsupportedConfig,
                         "Stream configuration could not be converted to a compatible format",
@@ -1570,9 +1571,41 @@ const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 7] = [
 // Turns a `Format` into a `WAVEFORMATEXTENSIBLE`.
 //
 // Returns `None` if the WAVEFORMATEXTENSIBLE does not support the given format.
+// The `dwChannelMask` to advertise for `share_mode`.
+//
+// Shared mode keeps `KSAUDIO_SPEAKER_DIRECTOUT` (0), which is what this backend has always sent:
+// the Windows audio engine accepts it, cpal genuinely does not care about speaker positions, and
+// changing it would alter behaviour on every existing shared-mode stream for no benefit.
+//
+// Exclusive mode cannot keep it. The format goes to the driver rather than to the engine, and a
+// driver is entitled to reject a zero mask -- `IsFormatSupported` answers
+// `AUDCLNT_E_UNSUPPORTED_FORMAT`, indistinguishable from "this endpoint has no exclusive mode at
+// all". Measured on a PreSonus AudioBox 22VSL (USB, Windows 11): 24-bit-in-a-32-bit-container at
+// 48 kHz stereo is refused with mask 0 and accepted with `SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT`,
+// every other field identical. Microsoft's own HD Audio driver accepts either, which is why this
+// only shows up on third-party hardware.
+//
+// The same mask must be used when probing and when initializing, or the two disagree and a format
+// that `IsFormatSupported` approved fails at `Initialize`. Both paths reach it through here.
+fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
+    match share_mode {
+        ShareMode::Shared => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+        ShareMode::Exclusive => match channels {
+            1 => KernelStreaming::SPEAKER_FRONT_CENTER,
+            2 => KernelStreaming::SPEAKER_FRONT_LEFT | KernelStreaming::SPEAKER_FRONT_RIGHT,
+            // No standard layout is known for this width, so claim the lowest `channels`
+            // positions. Better than 0, which some drivers reject outright; not authoritative,
+            // and a driver wanting a specific layout may still refuse it.
+            n if n < 32 => (1u32 << n) - 1,
+            _ => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+        },
+    }
+}
+
 fn config_to_waveformatextensible(
     config: StreamConfig,
     sample_format: SampleFormat,
+    share_mode: ShareMode,
 ) -> Option<Audio::WAVEFORMATEXTENSIBLE> {
     let format_tag = match sample_format {
         SampleFormat::U8 | SampleFormat::I16 => Audio::WAVE_FORMAT_PCM,
@@ -1613,8 +1646,7 @@ fn config_to_waveformatextensible(
         cbSize: cb_size,
     };
 
-    // CPAL does not care about speaker positions, so pass audio right through.
-    let channel_mask = KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT;
+    let channel_mask = channel_mask_for(share_mode, channels);
 
     let sub_format = match sample_format {
         SampleFormat::U8
@@ -1677,6 +1709,7 @@ unsafe fn exclusive_default_format(
                 buffer_size: BufferSize::Default,
             },
             sample_format,
+            ShareMode::Exclusive,
         ) else {
             continue;
         };
