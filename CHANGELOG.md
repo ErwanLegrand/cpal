@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+- **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
+  hands the packet back to WASAPI on the capture error paths that used to leak it.
+- **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
+  negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
+  `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
 
 ## [0.18.2] - 2026-08-16
 
