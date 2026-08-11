@@ -11,10 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StreamTrait::stop` ends a stream gracefully, draining buffered audio before halting (blocking up to a caller-supplied timeout). Dropping a stream still halts immediately without draining.
 - `CallbackInfo::xrun()` reports buffer over/underruns via the data callback.
+- `cpal::platform` now exports `ShareMode`, `WasapiStreamOptions` and the `WasapiDeviceExt`
+  extension trait on every platform, so asking for a WASAPI share mode needs no `cfg` attribute.
+  Only the implementation behind them is Windows-only; elsewhere, exclusive mode is refused rather
+  than silently downgraded.
 - **AudioWorklet**: Input streams are now supported.
-- **WASAPI**: Exclusive-mode streams, requested through the `WasapiDeviceExt` extension trait and
-  `WasapiStreamOptions`. Share mode stays out of the cross-platform `StreamConfig`; callers that do
-  not ask for it get unchanged shared-mode behaviour.
+- **WASAPI**: Exclusive-mode streams and configuration queries, through `WasapiDeviceExt`. Callers
+  that do not ask for a share mode get unchanged shared-mode behaviour.
 - **WebAudio**: Input streams are now supported.
 
 ### Changed
