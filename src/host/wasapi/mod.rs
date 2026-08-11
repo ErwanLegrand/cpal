@@ -11,9 +11,9 @@ pub use self::device::{
     default_input_device, default_output_device, Device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
 };
-pub use self::ext::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
 #[allow(unused_imports)]
 pub use self::stream::Stream;
+pub(crate) use crate::platform::ShareMode;
 use crate::{traits::HostTrait, Error, ErrorKind};
 
 mod device;
