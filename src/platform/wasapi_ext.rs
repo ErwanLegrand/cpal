@@ -326,11 +326,19 @@ pub trait WasapiDeviceExt {
     }
 }
 
-/// The error reported when exclusive mode is asked of a device with no WASAPI endpoint.
-fn exclusive_unsupported() -> Error {
+/// The error reported when WASAPI-specific options are asked of a device with no WASAPI
+/// endpoint. Exclusive mode is named separately, being the option a caller is most likely to
+/// have asked for deliberately.
+fn unsupported_options(options: WasapiStreamOptions) -> Error {
+    if options.share_mode != ShareMode::Shared {
+        return Error::with_message(
+            ErrorKind::UnsupportedOperation,
+            "Exclusive mode requires a WASAPI device",
+        );
+    }
     Error::with_message(
         ErrorKind::UnsupportedOperation,
-        "Exclusive mode requires a WASAPI device",
+        "These WASAPI stream options require a WASAPI device",
     )
 }
 
@@ -357,10 +365,12 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.default_input_config_with(options);
         }
-        // Not a WASAPI endpoint, so exclusive mode is refused rather than answered for shared.
+        // Not a WASAPI endpoint, so the options are refused rather than answered for shared.
+        // Compared against the default as a whole rather than by field, so an option added to
+        // `WasapiStreamOptions` later is refused here too instead of being silently dropped.
         // See the module documentation.
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::default_input_config(self)
     }
@@ -373,8 +383,8 @@ impl WasapiDeviceExt for super::Device {
         if let Some(device) = wasapi_device(self) {
             return device.default_output_config_with(options);
         }
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::default_output_config(self)
     }
@@ -389,8 +399,8 @@ impl WasapiDeviceExt for super::Device {
                 .supported_input_configs_with(options)
                 .map(super::SupportedInputConfigs::from_wasapi);
         }
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::supported_input_configs(self)
     }
@@ -405,8 +415,8 @@ impl WasapiDeviceExt for super::Device {
                 .supported_output_configs_with(options)
                 .map(super::SupportedOutputConfigs::from_wasapi);
         }
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::supported_output_configs(self)
     }
@@ -437,8 +447,8 @@ impl WasapiDeviceExt for super::Device {
                 )
                 .map(Into::into);
         }
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::build_input_stream_raw(
             self,
@@ -476,8 +486,8 @@ impl WasapiDeviceExt for super::Device {
                 )
                 .map(Into::into);
         }
-        if options.share_mode != ShareMode::Shared {
-            return Err(exclusive_unsupported());
+        if options != WasapiStreamOptions::default() {
+            return Err(unsupported_options(options));
         }
         DeviceTrait::build_output_stream_raw(
             self,
