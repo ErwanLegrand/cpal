@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AudioWorklet**: Fix dropouts in output streams when the callback buffer grows.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+- **WASAPI**: Output streams now report a backend error instead of panicking or underflowing when a driver reports more padding than the buffer holds.
 
 ## [0.18.2] - 2026-08-16
 
