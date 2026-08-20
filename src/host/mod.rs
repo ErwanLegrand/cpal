@@ -244,9 +244,15 @@ pub(crate) use error_emit::try_emit_error;
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "windows",
     target_vendor = "apple",
-    feature = "audioworklet",
+    all(windows, any(feature = "asio", feature = "jack")),
+    all(
+        target_arch = "wasm32",
+        target_os = "unknown",
+        feature = "wasm-bindgen",
+        feature = "audioworklet",
+        target_feature = "atomics"
+    ),
 ))]
 #[inline]
 pub(crate) fn frames_to_duration(
