@@ -942,8 +942,15 @@ fn process_output(
         let mut data = Data::from_parts(data, len, stream.sample_format);
         if !stream.draining.load(Ordering::Relaxed) {
             let sample_rate = stream.config.sample_rate;
+            // The packet must not stay checked out; releasing 0 frames renders nothing.
             let timestamp =
-                output_timestamp(stream, sample_rate, clock_frequency, *frames_written)?;
+                match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
+                    Ok(timestamp) => timestamp,
+                    Err(err) => {
+                        let _ = render_client.ReleaseBuffer(0, 0);
+                        return Err(err);
+                    }
+                };
             // WASAPI exposes no render-side xrun signal.
             data_callback(
                 &mut data,
