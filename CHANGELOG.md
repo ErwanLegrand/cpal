@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: Output streams now start with real audio immediately instead of undefined content in the render buffer.
 - **WASAPI**: A stream paused immediately after starting no longer plays silence before real audio on resume.
 - **WASAPI**: Fix `I64` and `F64` incorrectly reported as supported output formats.
+- **WASAPI**: Output streams now report a backend error instead of panicking or underflowing when a driver reports more padding than the buffer holds.
 
 ## [0.18.2] - 2026-08-16
 
