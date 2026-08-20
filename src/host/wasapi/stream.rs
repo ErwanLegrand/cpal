@@ -934,8 +934,12 @@ fn process_output(
         debug_assert!(!buffer.is_null());
 
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, stream.sample_format);
+        // Not bound to a name: the `&mut [u8]` over the render buffer must not still be live when
+        // the I24 pass below takes a second `&mut` slice over the same bytes.
+        fill_equilibrium(
+            slice::from_raw_parts_mut(buffer, byte_count),
+            stream.sample_format,
+        );
 
         let data = buffer as *mut ();
         let len = byte_count / stream.sample_format.sample_size();
@@ -952,17 +956,20 @@ fn process_output(
                     xrun: false,
                 },
             );
+        }
 
-            if stream.sample_format == SampleFormat::I24 {
-                // WASAPI stores i24 in the upper bits
-                #[expect(
-                    clippy::cast_ptr_alignment,
-                    reason = "WASAPI guarantees the buffer to be aligned to a frame boundary"
-                )]
-                let buffer_slice_i32 = slice::from_raw_parts_mut(buffer.cast::<i32>(), len);
-                for sample in buffer_slice_i32 {
-                    *sample <<= 8;
-                }
+        // Whatever is in the buffer now — the callback's samples, or the equilibrium fill when
+        // draining — is what WASAPI takes at `ReleaseBuffer`, so it is what has to be justified.
+        // Equilibrium happens to be zero for I24, but that is the fill's business, not this pass's.
+        if stream.sample_format == SampleFormat::I24 {
+            // WASAPI stores i24 in the upper bits
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "WASAPI guarantees the buffer to be aligned to a frame boundary"
+            )]
+            let buffer_slice_i32 = slice::from_raw_parts_mut(buffer.cast::<i32>(), len);
+            for sample in buffer_slice_i32 {
+                *sample <<= 8;
             }
         }
 
