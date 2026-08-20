@@ -720,9 +720,9 @@ impl Device {
                         None,
                     ) {
                         let usable = is_output
-                            || is_format_supported(
+|| is_format_supported(
                                 client,
-                                &waveformat.Format as *const Audio::WAVEFORMATEX,
+                                waveformatex_ptr(&waveformat),
                                 Audio::AUDCLNT_SHAREMODE_SHARED,
                             )?;
                         if usable {
@@ -885,7 +885,7 @@ impl Device {
                         stream_flags,
                         buffer_duration,
                         0,
-                        &format_attempt.Format,
+                        waveformatex_ptr(&format_attempt),
                         None,
                     )
                     .context("Failed to initialize audio client")?;
@@ -990,7 +990,7 @@ impl Device {
                             | Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
                         buffer_duration,
                         0,
-                        &format_attempt.Format,
+                        waveformatex_ptr(&format_attempt),
                         None,
                     )
                     .context("Failed to initialize audio client")?;
@@ -1431,6 +1431,12 @@ fn config_to_waveformatextensible(
     };
 
     Some(waveformatextensible)
+}
+
+// A driver reads as far as `cbSize` says, so the pointer has to carry provenance over the
+// whole WAVEFORMATEXTENSIBLE, not just its WAVEFORMATEX prefix.
+fn waveformatex_ptr(format: &Audio::WAVEFORMATEXTENSIBLE) -> *const Audio::WAVEFORMATEX {
+    ptr::from_ref(format).cast()
 }
 
 /// Get the default device period in frames for a shared-mode stream.
