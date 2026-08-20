@@ -17,9 +17,8 @@
 //! let device = cpal::default_host().default_output_device().unwrap();
 //! let options = WasapiStreamOptions::default().with_share_mode(ShareMode::Exclusive);
 //!
-//! // Exclusive mode exposes a different set of formats, so negotiate with the same options the
-//! // stream will be built with, and build in the sample format that came back: there is no engine
-//! // to convert from any other.
+//! // Exclusive mode exposes a different set of formats, so negotiate and build with the same
+//! // options, in the sample format that came back.
 //! let config = device.default_output_config_with(options)?;
 //! let stream = device.build_output_stream_raw_with(
 //!     config.config(),
@@ -55,7 +54,7 @@ use std::time::Duration;
 
 use crate::{
     CallbackInfo, Data, Error, ErrorKind, SampleFormat, SizedSample, StreamConfig,
-    SupportedStreamConfig, SupportedStreamConfigRange, traits::DeviceTrait,
+    SupportedStreamConfig, traits::DeviceTrait,
 };
 
 /// How a WASAPI stream shares its endpoint with the rest of the system.
@@ -116,17 +115,15 @@ impl WasapiStreamOptions {
 ///
 /// See the [module documentation](self) for what these methods do when the device has no WASAPI
 /// endpoint behind it.
-pub trait WasapiDeviceExt {
-    /// The iterator of supported input configurations produced by this device's queries.
-    type SupportedInputConfigs: Iterator<Item = SupportedStreamConfigRange>;
-
-    /// The iterator of supported output configurations produced by this device's queries.
-    type SupportedOutputConfigs: Iterator<Item = SupportedStreamConfigRange>;
-
-    /// The stream type produced by this device's builders.
-    type Stream;
-
+pub trait WasapiDeviceExt: DeviceTrait {
     /// The default input stream configuration for the device under `options`.
+    ///
+    /// # Warning
+    ///
+    /// The returned configuration records no share mode. Build from it with
+    /// [`build_input_stream_raw_with`](Self::build_input_stream_raw_with) and the same `options`:
+    /// [`DeviceTrait::build_input_stream_raw`] opens shared mode, with no error to say the
+    /// exclusive-mode request was dropped.
     ///
     /// # Errors
     ///
@@ -146,6 +143,13 @@ pub trait WasapiDeviceExt {
 
     /// The default output stream configuration for the device under `options`.
     ///
+    /// # Warning
+    ///
+    /// The returned configuration records no share mode. Build from it with
+    /// [`build_output_stream_raw_with`](Self::build_output_stream_raw_with) and the same
+    /// `options`: [`DeviceTrait::build_output_stream_raw`] opens shared mode, where the engine
+    /// converts an exclusive-mode format instead of reporting anything.
+    ///
     /// # Errors
     ///
     /// As [`DeviceTrait::default_output_config`], and additionally:
@@ -164,6 +168,13 @@ pub trait WasapiDeviceExt {
 
     /// The input stream configurations supported by the device under `options`.
     ///
+    /// # Warning
+    ///
+    /// The returned ranges record no share mode. Build from one with
+    /// [`build_input_stream_raw_with`](Self::build_input_stream_raw_with) and the same `options`:
+    /// [`DeviceTrait::build_input_stream_raw`] opens shared mode, with no error to say the
+    /// exclusive-mode request was dropped.
+    ///
     /// # Errors
     ///
     /// As [`DeviceTrait::supported_input_configs`], and additionally:
@@ -181,6 +192,13 @@ pub trait WasapiDeviceExt {
     ) -> Result<Self::SupportedInputConfigs, Error>;
 
     /// The output stream configurations supported by the device under `options`.
+    ///
+    /// # Warning
+    ///
+    /// The returned ranges record no share mode. Build from one with
+    /// [`build_output_stream_raw_with`](Self::build_output_stream_raw_with) and the same
+    /// `options`: [`DeviceTrait::build_output_stream_raw`] opens shared mode, where the engine
+    /// converts an exclusive-mode format instead of reporting anything.
     ///
     /// # Errors
     ///
@@ -353,10 +371,6 @@ fn wasapi_device(device: &super::Device) -> Option<&crate::host::wasapi::Device>
 }
 
 impl WasapiDeviceExt for super::Device {
-    type SupportedInputConfigs = super::SupportedInputConfigs;
-    type SupportedOutputConfigs = super::SupportedOutputConfigs;
-    type Stream = super::Stream;
-
     fn default_input_config_with(
         &self,
         options: WasapiStreamOptions,

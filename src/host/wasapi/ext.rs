@@ -12,10 +12,6 @@ use crate::{
 };
 
 impl WasapiDeviceExt for super::Device {
-    type SupportedInputConfigs = super::SupportedInputConfigs;
-    type SupportedOutputConfigs = super::SupportedOutputConfigs;
-    type Stream = super::Stream;
-
     fn default_input_config_with(
         &self,
         options: WasapiStreamOptions,

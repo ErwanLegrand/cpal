@@ -10,6 +10,10 @@ pub use self::device::{
     Device, Devices, SupportedInputConfigs, SupportedOutputConfigs, default_input_device,
     default_output_device,
 };
+#[expect(
+    unused_imports,
+    reason = "re-exported for public API via platform module"
+)]
 pub use self::stream::Stream;
 pub(crate) use crate::platform::ShareMode;
 use crate::{Error, ErrorKind, traits::HostTrait};
