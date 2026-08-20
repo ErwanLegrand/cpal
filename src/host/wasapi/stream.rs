@@ -1,5 +1,4 @@
 use std::{
-    mem,
     ops::ControlFlow,
     ptr, slice,
     sync::{
@@ -832,39 +831,50 @@ fn process_input(
     scratch_buffer: &mut [i32],
 ) -> Result<(), Error> {
     unsafe {
-        // Get the available data in the shared buffer.
-        let mut buffer: *mut u8 = ptr::null_mut();
-        let mut flags = mem::MaybeUninit::uninit();
         loop {
             let mut frames_available = match capture_client.GetNextPacketSize() {
                 Ok(0) => return Ok(()),
                 Ok(f) => f,
                 Err(err) => return Err(Error::from(err)),
             };
+            // Re-initialized every packet: the driver need not write the out-params, and a
+            // stale buffer from the previous packet would pass for freshly captured data.
+            let mut buffer: *mut u8 = ptr::null_mut();
+            let mut flags: u32 = 0;
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
-            let result = capture_client.GetBuffer(
+            capture_client.GetBuffer(
                 &mut buffer,
                 &mut frames_available,
-                flags.as_mut_ptr(),
+                &mut flags,
                 Some(&mut device_position),
                 Some(&mut qpc_position),
-            );
+            )?;
 
-            match result {
-                // TODO: Can this happen?
-                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
-                Err(e) => return Err(Error::from(e)),
-                Ok(_) => (),
+            // An empty packet is reported as `AUDCLNT_S_BUFFER_EMPTY`, a *success* code, so
+            // it surfaces here rather than as an error. Releasing a zero-size packet is
+            // optional, but keeps GetBuffer and ReleaseBuffer strictly alternating.
+            if frames_available == 0 {
+                let _ = capture_client.ReleaseBuffer(0);
+                return Ok(());
             }
 
-            let flags = flags.assume_init();
+            // A non-empty packet without a buffer is a driver bug. Release the packet in
+            // full, or the engine keeps re-presenting it and the stream silently stalls;
+            // the release's own error would only mask the more informative one below.
+            if buffer.is_null() {
+                let _ = capture_client.ReleaseBuffer(frames_available);
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioCaptureClient::GetBuffer returned a null buffer for a non-empty packet",
+                ));
+            }
+
             // The discontinuity flag is undefined on the first GetBuffer after Start,
             // where device_position is still 0.
             let xrun = device_position != 0
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
-            debug_assert!(!buffer.is_null());
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
             let data = if stream.sample_format == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
