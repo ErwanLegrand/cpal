@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
 - **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
   hands the packet back to WASAPI on the capture error paths that used to leak it.
+- **WASAPI**: A device or audio-service failure while querying format support is now reported
+  rather than answered as an unsupported format.
 - **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
   negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
   `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.

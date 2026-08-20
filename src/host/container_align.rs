@@ -18,33 +18,43 @@
 //! on the way in from it. Formats whose container is exactly full (`I16`, `I32`, `F32`, …) get a
 //! shift of zero from [`padding_bits`] and are not touched at all.
 //!
-//! A padded container of a width these functions cannot walk gets `None` rather than a shift, so
-//! the caller has to refuse the format instead of quietly sending it out misaligned.
-//!
 //! [`SampleFormat::I24`]: crate::SampleFormat::I24
 
-/// The container width these functions know how to walk, in bytes.
+/// The container width these functions walk, in bytes.
 ///
 /// The only padded container CPAL negotiates is `SampleFormat::I24` — 24 valid bits in four
-/// bytes — so this is the one width worth handling; [`padding_bits`] refuses every other padded
-/// width rather than guess at it.
+/// bytes — so this is the one width [`left_justify`] and [`right_align_into`] step through, and
+/// the one width a *padded* format may have. [`padding_bits`] asserts that.
 const CONTAINER_BYTES: usize = 4;
 
 /// How far a sample must move up to sit left-justified in its container, given the container size
 /// and the valid-bit count of the negotiated format, both in bits.
 ///
-/// `Some(0)` means "these bytes are already what the device wants": the container is exactly full,
-/// or the format declares no valid-bit count. `None` means the container is padded but not one
-/// [`left_justify`] and [`right_align_into`] can walk, which is a format to refuse — passing it
-/// through unshifted would be silently wrong by the width of the padding.
-pub(crate) fn padding_bits(container_bits: u16, valid_bits: u16) -> Option<u32> {
+/// Zero means "these bytes are already what the device wants": the container is exactly full, or
+/// the format declares no valid-bit count, and neither [`left_justify`] nor [`right_align_into`]
+/// then touches the samples at all.
+///
+/// # Panics
+///
+/// A padded container is only ever [`CONTAINER_BYTES`] wide here — the formats CPAL builds pad
+/// nothing else — and that is the only width the two walkers step through, so a padded container
+/// of any other width would be shifted as if it were four bytes wide. Debug builds assert against
+/// that, and against a format claiming more valid bits than its container holds; release builds
+/// answer as if the container were full, which leaves the bytes untouched rather than mangled.
+pub(crate) fn padding_bits(container_bits: u16, valid_bits: u16) -> u32 {
+    debug_assert!(
+        valid_bits <= container_bits,
+        "{valid_bits} valid bits do not fit in a {container_bits}-bit container",
+    );
     if valid_bits == 0 || valid_bits >= container_bits {
-        return Some(0);
+        return 0;
     }
-    if container_bits as usize != CONTAINER_BYTES * 8 {
-        return None;
-    }
-    Some(u32::from(container_bits - valid_bits))
+    debug_assert_eq!(
+        container_bits as usize,
+        CONTAINER_BYTES * 8,
+        "a padded {container_bits}-bit container is not one this module can walk",
+    );
+    u32::from(container_bits - valid_bits)
 }
 
 /// Moves every container in `buffer` up by `shift` bits, in place: right-aligned → left-justified.
@@ -105,37 +115,38 @@ mod tests {
     #[test]
     fn padding_bits_is_the_gap_between_the_container_and_the_sample() {
         // 24-in-32, the one case CPAL actually negotiates.
-        assert_eq!(padding_bits(32, 24), Some(8));
+        assert_eq!(padding_bits(32, 24), 8);
         // Any other partly-used 32-bit container follows the same arithmetic.
-        assert_eq!(padding_bits(32, 20), Some(12));
+        assert_eq!(padding_bits(32, 20), 12);
     }
 
     #[test]
     fn a_full_container_needs_no_shift() {
         // Answered before the container width is looked at, so every width reaches this.
-        assert_eq!(padding_bits(8, 8), Some(0));
-        assert_eq!(padding_bits(16, 16), Some(0));
+        assert_eq!(padding_bits(8, 8), 0);
+        assert_eq!(padding_bits(16, 16), 0);
         // Packed 24-bit: three-byte container, nothing spare in it.
-        assert_eq!(padding_bits(24, 24), Some(0));
-        assert_eq!(padding_bits(32, 32), Some(0));
-        assert_eq!(padding_bits(64, 64), Some(0));
-        // Nonsense a format could still contain; neither of them declares padding.
-        assert_eq!(padding_bits(32, 0), Some(0));
-        assert_eq!(padding_bits(32, 33), Some(0));
+        assert_eq!(padding_bits(24, 24), 0);
+        assert_eq!(padding_bits(32, 32), 0);
+        assert_eq!(padding_bits(64, 64), 0);
+        // A format declaring no valid-bit count at all: the container is full by definition.
+        assert_eq!(padding_bits(32, 0), 0);
     }
 
+    /// The width invariant the walkers rely on, checked the only way a total function can report
+    /// it. Nothing CPAL negotiates reaches here — `config_to_waveformatextensible` pads only
+    /// `I24`, in four bytes — so this stands in for a format a later change might add.
     #[test]
-    fn a_padded_container_that_cannot_be_walked_is_refused() {
-        // Spare bits, but no walk behind the width: answering zero here would put the samples out
-        // by the width of the padding with nothing reporting it.
-        assert_eq!(padding_bits(16, 12), None);
-        assert_eq!(padding_bits(24, 20), None);
-        assert_eq!(padding_bits(64, 48), None);
+    #[cfg(debug_assertions)]
+    #[should_panic = "not one this module can walk"]
+    fn a_padded_container_of_another_width_trips_the_invariant() {
+        // 12-in-16: spare bits, but `left_justify` would step through it four bytes at a time.
+        let _ = padding_bits(16, 12);
     }
 
     #[test]
     fn a_sample_survives_the_round_trip_through_a_wider_container() {
-        let shift = padding_bits(32, 24).unwrap();
+        let shift = padding_bits(32, 24);
         let samples = [I24_MIN, -8_000_000, -12_345, -1, 0, 1, 12_345, I24_MAX];
 
         let mut buffer = to_bytes(&samples);
@@ -149,7 +160,7 @@ mod tests {
 
     #[test]
     fn left_justify_puts_the_sample_at_the_top_of_the_container() {
-        let shift = padding_bits(32, 24).unwrap();
+        let shift = padding_bits(32, 24);
         let mut buffer = to_bytes(&[0, 1, -1, I24_MAX, I24_MIN]);
         left_justify(&mut buffer, shift);
 
@@ -168,7 +179,7 @@ mod tests {
 
     #[test]
     fn right_align_carries_the_sign_down_and_drops_the_padding() {
-        let shift = padding_bits(32, 24).unwrap();
+        let shift = padding_bits(32, 24);
         // What a device hands over: samples at the top of the container. The last one has dirty
         // padding bits, which the format declares meaningless and this must discard.
         let from_device = to_bytes(&[
@@ -191,7 +202,7 @@ mod tests {
     #[test]
     fn the_shift_is_the_one_the_format_asks_for() {
         // 20-in-32 rather than 24-in-32: twelve spare bits, not eight.
-        let shift = padding_bits(32, 20).unwrap();
+        let shift = padding_bits(32, 20);
         let samples = [0, 1, -1, -(1 << 19), (1 << 19) - 1];
 
         let mut buffer = to_bytes(&samples);
@@ -214,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_trailing_partial_container_is_left_alone() {
-        let shift = padding_bits(32, 24).unwrap();
+        let shift = padding_bits(32, 24);
         let mut buffer = to_bytes(&[1, 2]);
         buffer.extend_from_slice(&[0xAB, 0xCD]);
 
@@ -226,7 +237,7 @@ mod tests {
 
     #[test]
     fn a_sixteen_bit_format_is_passed_through_untouched() {
-        let shift = padding_bits(16, 16).unwrap();
+        let shift = padding_bits(16, 16);
         let samples: Vec<u8> = [0i16, 1, -1, i16::MIN, i16::MAX, 12_345]
             .iter()
             .flat_map(|s| s.to_ne_bytes())
@@ -240,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_thirty_two_bit_format_is_passed_through_untouched() {
-        let shift = padding_bits(32, 32).unwrap();
+        let shift = padding_bits(32, 32);
         let samples = to_bytes(&[0, 1, -1, i32::MIN, i32::MAX, 12_345]);
 
         let mut buffer = samples.clone();

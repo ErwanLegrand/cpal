@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
 use windows::{
     Win32::{
         Devices::Properties,
-        Foundation::{ERROR_TIMEOUT, PROPERTYKEY},
+        Foundation::{self, ERROR_TIMEOUT, PROPERTYKEY},
         Media::{Audio, Audio::IAudioRenderClient, KernelStreaming, Multimedia},
         System::{
             Com,
@@ -59,6 +59,11 @@ const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
 };
 
 const DEFAULT_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+/// The least time the exclusive-mode alignment retry gives its own activation, whatever is left
+/// of the caller's activation timeout by then. Only a floor: a caller whose whole budget is
+/// smaller than this gets that budget instead.
+const RETRY_ACTIVATION_FLOOR: Duration = Duration::from_millis(250);
 
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
 #[derive(Clone)]
@@ -227,11 +232,39 @@ pub unsafe fn is_format_supported(
         },
     };
 
-    // S_OK (hr.0 == 0): format is natively supported, Initialize will accept it without conversion.
-    // S_FALSE (hr.0 == 1): shared mode only, the engine proposed a closest match; that is usable
-    // only when AUTOCONVERTPCM is set (output). Exclusive mode reports
-    // AUDCLNT_E_UNSUPPORTED_FORMAT rather than S_FALSE.
-    Ok(hr.0 == 0)
+    match hr {
+        // The format is natively supported: Initialize will accept it without conversion.
+        Foundation::S_OK => Ok(true),
+        // Shared mode only, and only when the engine proposed a closest match, which is usable
+        // only with AUTOCONVERTPCM set (output). Exclusive mode answers
+        // AUDCLNT_E_UNSUPPORTED_FORMAT instead.
+        Foundation::S_FALSE | Audio::AUDCLNT_E_UNSUPPORTED_FORMAT => Ok(false),
+        // Not an answer about the format at all: the endpoint went away, the session's resources
+        // were reclaimed, or the audio service is not running. Reporting these as "unsupported"
+        // would empty out `supported_*_configs_with(Exclusive)`, which probes formats one by one
+        // with no other check in front of it, and turn an unplugged device into
+        // `UnsupportedConfig`. Propagated, they map to DeviceNotAvailable / StreamInvalidated /
+        // HostUnavailable in `impl From<windows::core::Error> for Error`.
+        Audio::AUDCLNT_E_DEVICE_INVALIDATED
+        | Audio::AUDCLNT_E_RESOURCES_INVALIDATED
+        | Audio::AUDCLNT_E_SERVICE_NOT_RUNNING => {
+            Err(windows::core::Error::from_hresult(hr)).context("Failed to query format support")
+        }
+        // Anything else — a driver rejecting the struct with E_INVALIDARG, say — is about this
+        // format, so it is a "no" for this format and not for the device.
+        _ => Ok(false),
+    }
+}
+
+/// The `WAVEFORMATEX` pointer to hand a WASAPI call for `format`.
+///
+/// Derived from the whole `WAVEFORMATEXTENSIBLE`, never from a borrow of its `.Format` field:
+/// `WAVEFORMATEX` is `#[repr(C, packed(1))]` and 18 bytes, while the structs this backend builds
+/// declare `cbSize = 22`, so the driver reads all 40 — and reads back through the same pointer in
+/// `format_from_waveformatex_ptr`. A pointer derived from `&format.Format` would carry provenance
+/// for only the header.
+fn waveformatex_ptr(format: &Audio::WAVEFORMATEXTENSIBLE) -> *const Audio::WAVEFORMATEX {
+    format as *const Audio::WAVEFORMATEXTENSIBLE as *const Audio::WAVEFORMATEX
 }
 
 // Get a cpal Format from a WAVEFORMATEX.
@@ -755,7 +788,7 @@ impl Device {
                             || is_format_supported(
                                 client,
                                 share_mode,
-                                &waveformat.Format as *const Audio::WAVEFORMATEX,
+                                waveformatex_ptr(&waveformat),
                             )?;
                         if usable {
                             supported_formats.push(SupportedStreamConfigRange {
@@ -1016,7 +1049,7 @@ impl Device {
                 share_mode,
                 stream_flags,
                 buffer_duration,
-                &format_attempt.Format,
+                &format_attempt,
                 activation_timeout,
             )?;
             let waveformatex = format_attempt.Format;
@@ -1153,7 +1186,7 @@ impl Device {
                 share_mode,
                 stream_flags,
                 buffer_duration,
-                &format_attempt.Format,
+                &format_attempt,
                 activation_timeout,
             )?;
             let waveformatex = format_attempt.Format;
@@ -1231,17 +1264,17 @@ impl Device {
     ///
     /// # Safety
     ///
-    /// `format` must point at a valid `WAVEFORMATEX` (with any trailing extension bytes it
-    /// declares), and COM must be initialized on the calling thread.
+    /// COM must be initialized on the calling thread.
     unsafe fn initialize_audio_client(
         &self,
         audio_client: Audio::IAudioClient,
         share_mode: ShareMode,
         stream_flags: u32,
         buffer_duration: i64,
-        format: &Audio::WAVEFORMATEX,
+        format: &Audio::WAVEFORMATEXTENSIBLE,
         activation_timeout: Option<Duration>,
     ) -> Result<Audio::IAudioClient, Error> {
+        let started = Instant::now();
         // An event-driven exclusive-mode stream must be given a periodicity, and it must equal
         // the buffer duration. Shared mode requires zero.
         let periodicity = match share_mode {
@@ -1249,6 +1282,7 @@ impl Device {
             ShareMode::Exclusive => buffer_duration,
         };
         let mode = to_winapi_share_mode(share_mode);
+        let format_ptr = waveformatex_ptr(format);
 
         let result = unsafe {
             audio_client.Initialize(
@@ -1256,7 +1290,7 @@ impl Device {
                 stream_flags,
                 buffer_duration,
                 periodicity,
-                format,
+                format_ptr,
                 None,
             )
         };
@@ -1277,17 +1311,28 @@ impl Device {
         // next size up that satisfies the endpoint's alignment constraint.
         let aligned_frames =
             unsafe { audio_client.GetBufferSize() }.context("Failed to get aligned buffer size")?;
-        if aligned_frames == 0 || format.nSamplesPerSec == 0 {
+        if aligned_frames == 0 || format.Format.nSamplesPerSec == 0 {
             return Err(Error::from(err)).context("Failed to initialize audio client");
         }
 
         // A client whose Initialize failed cannot be initialized again; release it and activate
         // a replacement before retrying with the aligned duration.
         drop(audio_client);
-        let aligned_duration =
-            buffer_size_to_duration(&BufferSize::Fixed(aligned_frames), format.nSamplesPerSec);
+        let aligned_duration = buffer_size_to_duration(
+            &BufferSize::Fixed(aligned_frames),
+            format.Format.nSamplesPerSec,
+        );
+        // The caller's timeout covers building this stream, not each activation within it, so the
+        // retry gets what is left of it rather than a second full budget. A remainder at or near
+        // zero would fail a device that is merely slow to activate, so it is floored — never
+        // above the budget the caller gave in the first place.
+        let retry_timeout = activation_timeout.map(|budget| {
+            budget
+                .saturating_sub(started.elapsed())
+                .max(RETRY_ACTIVATION_FLOOR.min(budget))
+        });
         let audio_client = self
-            .build_audioclient(activation_timeout)
+            .build_audioclient(retry_timeout)
             .context("Failed to rebuild audio client for aligned buffer")?;
         unsafe {
             audio_client.Initialize(
@@ -1295,7 +1340,7 @@ impl Device {
                 stream_flags,
                 aligned_duration,
                 aligned_duration,
-                format,
+                waveformatex_ptr(format),
                 None,
             )
         }
@@ -1751,21 +1796,20 @@ fn config_to_waveformatextensible(
         SubFormat: sub_format,
     };
 
-    let shift = container_shift(&waveformatextensible)?;
+    let shift = container_shift(&waveformatextensible);
 
     Some((waveformatextensible, shift))
 }
 
-/// How far the negotiated format's samples must move up to sit left-justified in their container,
-/// or `None` for a padded container the backend cannot align.
+/// How far the negotiated format's samples must move up to sit left-justified in their container.
 ///
 /// Read off the `WAVEFORMATEXTENSIBLE` handed to `Initialize` rather than off the `SampleFormat`,
 /// so the answer comes from the format's own two bit counts and no format has to be named here.
-fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> Option<u32> {
+fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
     // A plain `WAVE_FORMAT_PCM` header carries no extension for the device to read, so its
     // `wValidBitsPerSample` means nothing and the container is full by definition.
     if format.Format.cbSize == 0 {
-        return Some(0);
+        return 0;
     }
     // SAFETY: `Samples` is a union of three `u16`s. `wValidBitsPerSample` is the member
     // `config_to_waveformatextensible` writes, and the one `WAVE_FORMAT_EXTENSIBLE` defines for
@@ -1837,14 +1881,16 @@ unsafe fn exclusive_default_format(
         ) else {
             continue;
         };
-        // Derived from the whole struct, not from `.Format`: `format_from_waveformatex_ptr` reads
-        // the extension bytes back through this pointer, which a borrow of the 18-byte header
-        // does not cover.
-        let format_ptr = &waveformat as *const _ as *const Audio::WAVEFORMATEX;
+        let format_ptr = waveformatex_ptr(&waveformat);
         // SAFETY: `format_ptr` points at the `WAVEFORMATEXTENSIBLE` just built, which outlives
         // both calls, and `client` is the endpoint's own audio client.
         if unsafe { is_format_supported(client, ShareMode::Exclusive, format_ptr) }? {
-            return Ok(unsafe { format_from_waveformatex_ptr(format_ptr, client) });
+            // Only a format that maps back to a `SupportedStreamConfig` settles the search: one
+            // the mapper does not recognise must not stop the probe and hide every lower-ranked
+            // format behind it.
+            if let Some(config) = unsafe { format_from_waveformatex_ptr(format_ptr, client) } {
+                return Ok(Some(config));
+            }
         }
     }
 
