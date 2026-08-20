@@ -651,22 +651,23 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
     Ok(handle_idx)
 }
 
-// Get the number of available frames that are available for writing/reading.
+// Frames the render buffer can accept this pass, paired with the frames already queued for
+// playback ahead of them.
 #[inline]
-fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
-    // An event-driven exclusive-mode stream is handed one whole buffer per event, and
-    // `GetCurrentPadding` carries no useful information there — it reports the full buffer, so
-    // the shared-mode subtraction would yield zero on every pass and nothing would ever be
-    // written.
+fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount), Error> {
+    // An event-driven exclusive-mode stream is handed one whole buffer per event, and the
+    // padding value is documented as carrying no useful information for that case. Both figures
+    // follow from the one-buffer-per-pass contract instead: the pass writes the whole buffer, so
+    // a whole buffer also bounds what can still be queued when `stop()` reads the fill.
     if stream.share_mode == ShareMode::Exclusive {
-        return Ok(stream.max_frames_in_buffer);
+        return Ok((stream.max_frames_in_buffer, stream.max_frames_in_buffer));
     }
     unsafe {
         let padding = stream
             .audio_client
             .GetCurrentPadding()
             .context("Failed to get current padding")?;
-        Ok(stream.max_frames_in_buffer - padding)
+        Ok((stream.max_frames_in_buffer - padding, padding))
     }
 }
 
@@ -958,14 +959,12 @@ fn process_output(
     clock_frequency: u64,
     frames_written: &mut u64,
 ) -> Result<(), Error> {
-    // The number of frames available for writing.
-    let frames_available = match get_available_frames(stream)? {
-        0 => return Ok(()), // TODO: Can this happen?
-        n => n,
+    let (frames_available, frames_queued) = match render_buffer_state(stream)? {
+        (0, _) => return Ok(()), // TODO: Can this happen?
+        state => state,
     };
 
-    let padding = stream.max_frames_in_buffer - frames_available;
-    let fill_usec = (padding as u64)
+    let fill_usec = (frames_queued as u64)
         .saturating_mul(1_000_000)
         .saturating_div(stream.config.sample_rate as u64)
         .saturating_add(
