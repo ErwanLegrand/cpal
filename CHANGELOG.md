@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AudioWorklet**: Fix dropouts in output streams when the callback buffer grows.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+- **WASAPI**: A configuration whose derived `WAVEFORMATEX` fields overflow is now rejected as `UnsupportedConfig` instead of panicking in debug builds and wrapping in release.
 
 ## [0.18.2] - 2026-08-16
 
