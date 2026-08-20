@@ -702,41 +702,46 @@ impl Device {
             let assume_convertible =
                 share_mode == ShareMode::Shared && self.data_flow() == Audio::eRender;
 
-            // For convertible output, restrict to rates the MF Resampler can handle; otherwise
-            // probe all, since the device answers for itself.
+            // For convertible output, restrict to rates the MF Resampler can handle. Exclusive
+            // mode pays a blocking driver round-trip per probe, so it stops at the rates PCM
+            // hardware runs. Shared-mode capture is answered by the engine, so it probes all.
             let mut sample_rates: Vec<SampleRate> = COMMON_SAMPLE_RATES
                 .iter()
                 .copied()
                 .filter(|&r| {
-                    !assume_convertible
-                        || (OUTPUT_MIN_SAMPLE_RATE..=OUTPUT_MAX_SAMPLE_RATE).contains(&r)
+                    if assume_convertible {
+                        (OUTPUT_MIN_SAMPLE_RATE..=OUTPUT_MAX_SAMPLE_RATE).contains(&r)
+                    } else if share_mode == ShareMode::Exclusive {
+                        (EXCLUSIVE_MIN_SAMPLE_RATE..=EXCLUSIVE_MAX_SAMPLE_RATE).contains(&r)
+                    } else {
+                        true
+                    }
                 })
                 .collect();
+            // The endpoint's own rate is probed whether or not it falls inside those bounds.
             if !sample_rates.contains(&format.sample_rate) {
                 sample_rates.push(format.sample_rate);
             }
 
-            let device_period_hns = device_period_hns(client, share_mode);
+            let sample_formats: &[SampleFormat] = match share_mode {
+                ShareMode::Shared => &WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS,
+                ShareMode::Exclusive => &EXCLUSIVE_SAMPLE_FORMATS,
+            };
+
+            let device_periods_hns = device_periods_hns(client);
 
             let mut supported_formats = Vec::new();
             for sample_rate in sample_rates {
                 let buffer_size = match format.buffer_size {
-                    // Software stacks: substitute the device period expressed in frames
-                    // at this sample rate.
-                    SupportedBufferSize::Unknown => device_period_hns
-                        .map(|p_hns| {
-                            let frames = buffer_duration_to_frames(p_hns, sample_rate);
-                            SupportedBufferSize::Range {
-                                min: frames,
-                                max: frames,
-                            }
-                        })
+                    // Software stacks: substitute what the device period allows at this rate.
+                    SupportedBufferSize::Unknown => device_periods_hns
+                        .map(|periods| period_buffer_size(periods, share_mode, sample_rate))
                         .unwrap_or(SupportedBufferSize::Unknown),
                     // Hardware stacks: report the hardware buffer size limits as-is.
                     other => other,
                 };
 
-                for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
+                for sample_format in sample_formats.iter().copied() {
                     if let Some((waveformat, _)) = config_to_waveformatextensible(
                         StreamConfig {
                             channels: format.channels,
@@ -805,7 +810,7 @@ impl Device {
     //
     // In exclusive mode there is no mixer, so the mix format carries no such guarantee — it
     // describes the engine, not the endpoint. There the device's channel count and sample rate
-    // are taken from the mix format but the sample format is probed for, highest precision first.
+    // are taken from the mix format but the sample format is probed for, most preferred first.
     fn default_format(&self, share_mode: ShareMode) -> Result<SupportedStreamConfig, Error> {
         // initializing COM because we call `CoTaskMemFree`
         com::com_initialized();
@@ -841,12 +846,9 @@ impl Device {
             };
 
             if config.buffer_size == SupportedBufferSize::Unknown {
-                if let Some(period_hns) = device_period_hns(client, share_mode) {
-                    let frames = buffer_duration_to_frames(period_hns, config.sample_rate);
-                    config.buffer_size = SupportedBufferSize::Range {
-                        min: frames,
-                        max: frames,
-                    };
+                if let Some(periods_hns) = device_periods_hns(client) {
+                    config.buffer_size =
+                        period_buffer_size(periods_hns, share_mode, config.sample_rate);
                 }
             }
             Ok(config)
@@ -973,7 +975,7 @@ impl Device {
             // what is requested here; the value only affects ring-buffer latency.
             //
             // Exclusive mode: this is also the periodicity, so zero is not a legal value and
-            // `BufferSize::Default` resolves to the device's minimum period instead.
+            // `BufferSize::Default` resolves to the device's default period instead.
             let buffer_duration = buffer_duration_for(
                 &audio_client,
                 share_mode,
@@ -1596,6 +1598,17 @@ impl From<Audio::EDataFlow> for DeviceDirection {
 const OUTPUT_MIN_SAMPLE_RATE: SampleRate = 8_000;
 const OUTPUT_MAX_SAMPLE_RATE: SampleRate = 384_000;
 
+// Sample rate range probed in exclusive mode. Endpoint hardware runs between 8 kHz and the 768 kHz
+// of the fastest PCM converters; the DSD rates above that in `COMMON_SAMPLE_RATES` have no PCM or
+// IEEE-float encoding to ask `IsFormatSupported` about, so probing them only spends a driver
+// round-trip per sample format to be refused.
+const EXCLUSIVE_MIN_SAMPLE_RATE: SampleRate = 8_000;
+const EXCLUSIVE_MAX_SAMPLE_RATE: SampleRate = 768_000;
+
+// The longest buffer `IAudioClient::Initialize` accepts from an event-driven exclusive-mode
+// client; longer is documented to fail with AUDCLNT_E_BUFFER_SIZE_ERROR.
+const EXCLUSIVE_MAX_BUFFER_HNS: i64 = 5_000 * 10_000;
+
 // Formats encodable as WAVEFORMATEXTENSIBLE. U8/I16 map to WAVE_FORMAT_PCM; the rest use
 // WAVE_FORMAT_EXTENSIBLE. Unsigned formats wider than 8 bits are omitted: KSDATAFORMAT_SUBTYPE_PCM
 // is always signed for 16-bit and wider, so submitting unsigned data would produce a DC offset.
@@ -1761,21 +1774,42 @@ fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> Option<u32> {
     container_align::padding_bits(format.Format.wBitsPerSample, valid_bits)
 }
 
-// Sample formats probed for an exclusive-mode default configuration, most precise first.
+// Sample formats probed against the endpoint in exclusive mode, where `GetMixFormat` answers for
+// the engine rather than for the device. I24 is included because 24-bit-in-a-32-bit-container is
+// what many audio interfaces run natively.
 //
-// `GetMixFormat` describes the shared-mode engine, so it says nothing about what the endpoint
-// accepts in exclusive mode; the device is asked directly instead. I24 is included because
-// 24-bit-in-a-32-bit-container is what many audio interfaces run natively.
-const EXCLUSIVE_SAMPLE_FORMATS: [SampleFormat; 6] = [
-    SampleFormat::I64,
+// `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit entries: endpoints expose 8- to 32-bit
+// containers, cpal's own ranking treats 64-bit integers as accumulator types rather than stream
+// formats, and every entry here costs a blocking driver round-trip per sample rate.
+const EXCLUSIVE_SAMPLE_FORMATS: [SampleFormat; 5] = [
+    SampleFormat::U8,
+    SampleFormat::I16,
+    SampleFormat::I24,
     SampleFormat::I32,
     SampleFormat::F32,
-    SampleFormat::I24,
-    SampleFormat::I16,
-    SampleFormat::U8,
 ];
 
-/// Finds the highest-precision format the endpoint accepts in exclusive mode, at the channel
+/// `EXCLUSIVE_SAMPLE_FORMATS`, most preferred first.
+///
+/// Ordered by `cmp_default_heuristics` rather than by hand, so the format `default_*_config_with`
+/// settles on stays the one that ranking `supported_*_configs_with` would pick.
+fn exclusive_sample_formats_by_preference() -> [SampleFormat; EXCLUSIVE_SAMPLE_FORMATS.len()] {
+    fn ranked(sample_format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange {
+            channels: 2,
+            min_sample_rate: 48_000,
+            max_sample_rate: 48_000,
+            buffer_size: SupportedBufferSize::Unknown,
+            sample_format,
+        }
+    }
+
+    let mut formats = EXCLUSIVE_SAMPLE_FORMATS;
+    formats.sort_unstable_by(|a, b| ranked(*b).cmp_default_heuristics(&ranked(*a)));
+    formats
+}
+
+/// Finds the format the endpoint accepts in exclusive mode that cpal ranks highest, at the channel
 /// count and sample rate of the mix format.
 ///
 /// Returns `Ok(None)` when the device accepts none of them.
@@ -1791,7 +1825,7 @@ unsafe fn exclusive_default_format(
     let channels = unsafe { (*mix_format).nChannels };
     let sample_rate = unsafe { (*mix_format).nSamplesPerSec };
 
-    for sample_format in EXCLUSIVE_SAMPLE_FORMATS {
+    for sample_format in exclusive_sample_formats_by_preference() {
         let Some((waveformat, _)) = config_to_waveformatextensible(
             StreamConfig {
                 channels,
@@ -1817,29 +1851,48 @@ unsafe fn exclusive_default_format(
     Ok(None)
 }
 
-/// The device period in 100-nanosecond units that applies to `share_mode`, if it can be read.
-///
-/// Shared-mode streams are scheduled at the engine's *default* period; an exclusive-mode client
-/// owns the endpoint and can be scheduled as fast as its *minimum* period.
-fn device_period_hns(audio_client: &Audio::IAudioClient, share_mode: ShareMode) -> Option<i64> {
+/// The endpoint's default and minimum device periods, in 100-nanosecond units.
+fn device_periods_hns(audio_client: &Audio::IAudioClient) -> Option<(i64, i64)> {
     let mut default_period = 0i64;
     let mut minimum_period = 0i64;
-    let ok = unsafe {
-        audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut minimum_period))
+    unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut minimum_period)) }
+        .is_ok()
+        .then_some((default_period, minimum_period))
+}
+
+/// The buffer sizes to advertise at `sample_rate` when the endpoint reports no hardware limits.
+///
+/// A shared-mode client is scheduled at the engine's default period and does not choose its own
+/// size. An exclusive-mode client does, anywhere from the device's minimum period up to the
+/// ceiling `Initialize` documents — a bound on the request, not a promise the endpoint has the
+/// memory for it, which nothing short of calling `Initialize` will tell.
+fn period_buffer_size(
+    periods_hns: (i64, i64),
+    share_mode: ShareMode,
+    sample_rate: SampleRate,
+) -> SupportedBufferSize {
+    let (default_period, minimum_period) = periods_hns;
+    match share_mode {
+        ShareMode::Shared if default_period > 0 => {
+            let frames = buffer_duration_to_frames(default_period, sample_rate);
+            SupportedBufferSize::Range {
+                min: frames,
+                max: frames,
+            }
+        }
+        ShareMode::Exclusive if minimum_period > 0 => SupportedBufferSize::Range {
+            min: buffer_duration_to_frames(minimum_period, sample_rate),
+            max: buffer_duration_to_frames(EXCLUSIVE_MAX_BUFFER_HNS, sample_rate),
+        },
+        _ => SupportedBufferSize::Unknown,
     }
-    .is_ok();
-    let period = match share_mode {
-        ShareMode::Shared => default_period,
-        ShareMode::Exclusive => minimum_period,
-    };
-    (ok && period > 0).then_some(period)
 }
 
 /// The buffer duration, in 100-nanosecond units, to request from `IAudioClient::Initialize`.
 ///
 /// In shared mode `BufferSize::Default` becomes 0, asking the engine for its default period.
 /// Exclusive mode cannot use 0, since the same value is also the periodicity, so it resolves to
-/// the device's minimum period instead.
+/// the device's default period; the minimum period is reachable through `BufferSize::Fixed`.
 fn buffer_duration_for(
     audio_client: &Audio::IAudioClient,
     share_mode: ShareMode,
@@ -1850,14 +1903,15 @@ fn buffer_duration_for(
         (ShareMode::Shared, _) | (ShareMode::Exclusive, BufferSize::Fixed(_)) => {
             Ok(buffer_size_to_duration(buffer_size, sample_rate))
         }
-        (ShareMode::Exclusive, BufferSize::Default) => {
-            device_period_hns(audio_client, ShareMode::Exclusive).ok_or_else(|| {
+        (ShareMode::Exclusive, BufferSize::Default) => device_periods_hns(audio_client)
+            .map(|(default_period, _)| default_period)
+            .filter(|&period| period > 0)
+            .ok_or_else(|| {
                 Error::with_message(
                     ErrorKind::BackendError,
-                    "Failed to get the device's minimum period",
+                    "Failed to get the device's default period",
                 )
-            })
-        }
+            }),
     }
 }
 
@@ -1873,9 +1927,8 @@ fn stream_period_frames(
             shared_mode_period_frames(audio_client, sample_rate, max_frames_in_buffer)
         }
         // An event-driven exclusive-mode stream is handed the whole buffer on every event, so
-        // the buffer size *is* the callback size — which is not the same as the minimum device
-        // period whenever the caller asked for a fixed buffer size, or the endpoint rounded the
-        // request up to an aligned one.
+        // the buffer size *is* the callback size — which is not the same as the period that was
+        // requested whenever the endpoint rounded the request up to an aligned one.
         ShareMode::Exclusive => max_frames_in_buffer,
     }
 }
