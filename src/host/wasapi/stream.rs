@@ -870,12 +870,20 @@ fn process_input(
     scratch_buffer: &mut [i32],
 ) -> Result<(), Error> {
     unsafe {
+        // A driver whose `GetNextPacketSize` never reports an empty packet would keep
+        // `run_input` from ever polling its commands. What is left stays queued.
+        let max_frames_per_event = stream.max_frames_in_buffer.max(1);
+        let mut frames_drained: FrameCount = 0;
         loop {
+            if frames_drained >= max_frames_per_event {
+                return Ok(());
+            }
             let mut frames_available = match capture_client.GetNextPacketSize() {
                 Ok(0) => return Ok(()),
                 Ok(f) => f,
                 Err(err) => return Err(Error::from(err)),
             };
+            frames_drained = frames_drained.saturating_add(frames_available);
             // Re-initialized every packet: the driver need not write the out-params, and a
             // stale buffer from the previous packet would pass for freshly captured data.
             let mut buffer: *mut u8 = ptr::null_mut();
