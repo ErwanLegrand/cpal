@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
 - **AudioWorklet**: Fix dropouts in output streams when the callback buffer grows.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
+- **WASAPI**: An oversized capture packet is now reported as a stream error instead of a panic or over-read.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
 - **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
 - **WASAPI**: A configuration whose derived `WAVEFORMATEX` fields overflow is now rejected as `UnsupportedConfig` instead of panicking in debug builds and wrapping in release.

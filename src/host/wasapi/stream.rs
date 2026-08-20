@@ -922,13 +922,21 @@ fn process_input(
             let xrun = device_position != 0
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
+            // Every length below is derived from this frame count, and the scratch buffer is
+            // sized for a whole buffer's worth of it.
+            if frames_available > stream.max_frames_in_buffer {
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioCaptureClient::GetBuffer returned more frames than the buffer holds",
+                ));
+            }
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
             let data = if stream.sample_format == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
-                let source_data =
-                    slice::from_raw_parts(buffer.cast(), byte_count / size_of::<i32>());
+                let sample_count = byte_count / size_of::<i32>();
+                let source_data = slice::from_raw_parts(buffer.cast(), sample_count);
                 // use a scratch buffer since the capture buffer isn't meant to be written
-                let dst = &mut scratch_buffer[..source_data.len()];
+                let dst = &mut scratch_buffer[..sample_count];
                 dst.copy_from_slice(source_data);
                 for sample in dst.iter_mut() {
                     // On signed integers, >> is an arithmetic shift,
