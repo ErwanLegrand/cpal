@@ -210,6 +210,9 @@ pub unsafe fn is_format_supported(
 }
 
 // Get a cpal Format from a WAVEFORMATEX.
+//
+// Safety: `waveformatex_ptr` must point to a readable `WAVEFORMATEX` followed by the
+// `cbSize` extra bytes its header declares.
 unsafe fn format_from_waveformatex_ptr(
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
     audio_client: &Audio::IAudioClient,
@@ -228,6 +231,13 @@ unsafe fn format_from_waveformatex_ptr(
         (32, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F32,
         (64, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F64,
         (n_bits, KernelStreaming::WAVE_FORMAT_EXTENSIBLE) => {
+            // The extension is only there to be read if `cbSize` accounts for it.
+            let extension_size = mem::size_of::<Audio::WAVEFORMATEXTENSIBLE>()
+                - mem::size_of::<Audio::WAVEFORMATEX>();
+            if usize::from(unsafe { (*waveformatex_ptr).cbSize }) < extension_size {
+                return None;
+            }
+
             let waveformatextensible_ptr = waveformatex_ptr as *const Audio::WAVEFORMATEXTENSIBLE;
             let sub = unsafe { (*waveformatextensible_ptr).SubFormat };
             let valid_bits = unsafe { (*waveformatextensible_ptr).Samples.wValidBitsPerSample };
