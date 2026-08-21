@@ -34,7 +34,7 @@ use windows::{
         },
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
-    core::{GUID, Interface},
+    core::{GUID, HRESULT, Interface},
 };
 
 use super::{
@@ -232,6 +232,11 @@ pub unsafe fn is_format_supported(
         },
     };
 
+    format_support_from_hresult(hr)
+}
+
+/// Classifies the `HRESULT` that `IAudioClient::IsFormatSupported` answered with.
+fn format_support_from_hresult(hr: HRESULT) -> Result<bool, Error> {
     match hr {
         // The format is natively supported: Initialize will accept it without conversion.
         Foundation::S_OK => Ok(true),
@@ -1973,6 +1978,8 @@ fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: SampleRate) -> F
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
 
     fn container_shift_for(sample_format: SampleFormat) -> u32 {
@@ -2062,5 +2069,159 @@ mod tests {
                 assert_eq!(mask.count_ones(), u32::from(channels), "{channels}");
             }
         }
+    }
+
+    #[test]
+    fn a_natively_supported_format_is_the_only_yes() {
+        assert!(format_support_from_hresult(Foundation::S_OK).expect("not an error"));
+    }
+
+    #[test]
+    fn a_refused_format_is_a_no_rather_than_an_error() {
+        for hr in [
+            Foundation::S_FALSE,
+            Audio::AUDCLNT_E_UNSUPPORTED_FORMAT,
+            // Unrelated failures are a driver quirk answering about this format, not about the
+            // device.
+            Foundation::E_INVALIDARG,
+            Foundation::E_FAIL,
+            Audio::AUDCLNT_E_DEVICE_IN_USE,
+        ] {
+            assert!(
+                !format_support_from_hresult(hr).expect("not an error"),
+                "{hr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_about_the_device_keeps_its_error_kind() {
+        for (hr, kind) in [
+            (
+                Audio::AUDCLNT_E_DEVICE_INVALIDATED,
+                ErrorKind::DeviceNotAvailable,
+            ),
+            (
+                Audio::AUDCLNT_E_RESOURCES_INVALIDATED,
+                ErrorKind::StreamInvalidated,
+            ),
+            (
+                Audio::AUDCLNT_E_SERVICE_NOT_RUNNING,
+                ErrorKind::HostUnavailable,
+            ),
+        ] {
+            let error = format_support_from_hresult(hr).expect_err("an error");
+            assert_eq!(error.kind(), kind, "{hr:?}");
+        }
+    }
+
+    fn ranked(sample_format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange {
+            channels: 2,
+            min_sample_rate: 48_000,
+            max_sample_rate: 48_000,
+            buffer_size: SupportedBufferSize::Unknown,
+            sample_format,
+        }
+    }
+
+    // Ranked here rather than compared against a second hardcoded list, so that a probe order
+    // disagreeing with `cmp_default_heuristics` cannot pass by being wrong in both places.
+    #[test]
+    fn the_exclusive_probe_order_agrees_with_cmp_default_heuristics() {
+        for pair in exclusive_sample_formats_by_preference().windows(2) {
+            let (preferred, next) = (pair[0], pair[1]);
+            assert_eq!(
+                ranked(preferred).cmp_default_heuristics(&ranked(next)),
+                Ordering::Greater,
+                "{preferred} must be probed before {next}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exclusive_probe_set_is_every_format_narrower_than_64_bits() {
+        let mut probed = exclusive_sample_formats_by_preference();
+        probed.sort_unstable();
+
+        let mut expected: Vec<SampleFormat> = WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS
+            .into_iter()
+            .filter(|sample_format| sample_format.sample_size() < 8)
+            .collect();
+        expected.sort_unstable();
+
+        assert_eq!(probed.as_slice(), expected.as_slice());
+    }
+
+    // A 10 ms default period and a 3 ms minimum period, in 100-nanosecond units.
+    const PERIODS_HNS: (i64, i64) = (100_000, 30_000);
+
+    #[test]
+    fn exclusive_buffer_sizes_span_the_minimum_period_to_the_initialize_ceiling() {
+        for (sample_rate, min, max) in [(48_000, 144, 240_000), (44_100, 132, 220_500)] {
+            assert_eq!(
+                period_buffer_size(PERIODS_HNS, ShareMode::Exclusive, sample_rate),
+                SupportedBufferSize::Range { min, max },
+                "{sample_rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_buffer_sizes_are_the_default_period_and_nothing_else() {
+        // Degenerate on purpose: a shared client does not choose its own buffer size.
+        for (sample_rate, frames) in [(48_000, 480), (44_100, 441), (96_000, 960)] {
+            assert_eq!(
+                period_buffer_size(PERIODS_HNS, ShareMode::Shared, sample_rate),
+                SupportedBufferSize::Range {
+                    min: frames,
+                    max: frames
+                },
+                "{sample_rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_period_reports_an_unknown_buffer_size() {
+        for (periods_hns, share_mode) in [
+            ((0, 30_000), ShareMode::Shared),
+            ((100_000, 0), ShareMode::Exclusive),
+            ((0, 0), ShareMode::Shared),
+            ((0, 0), ShareMode::Exclusive),
+        ] {
+            assert_eq!(
+                period_buffer_size(periods_hns, share_mode, 48_000),
+                SupportedBufferSize::Unknown,
+                "{periods_hns:?} {share_mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixed_buffer_size_survives_the_round_trip_through_a_duration() {
+        for sample_rate in [
+            8_000, 16_000, 22_050, 44_100, 48_000, 88_200, 96_000, 192_000,
+        ] {
+            for frames in [1, 64, 128, 256, 441, 480, 512, 1024, 2048, 4096] {
+                let duration = buffer_size_to_duration(&BufferSize::Fixed(frames), sample_rate);
+                assert_eq!(
+                    buffer_duration_to_frames(duration, sample_rate),
+                    frames,
+                    "{frames} frames at {sample_rate} Hz"
+                );
+            }
+        }
+        // 480 frames at 48 kHz is 10 ms, in 100-nanosecond units.
+        assert_eq!(
+            buffer_size_to_duration(&BufferSize::Fixed(480), 48_000),
+            100_000
+        );
+    }
+
+    #[test]
+    fn a_default_buffer_size_requests_no_particular_duration() {
+        assert_eq!(buffer_size_to_duration(&BufferSize::Default, 48_000), 0);
+        assert_eq!(buffer_duration_to_frames(0, 48_000), 0);
     }
 }
