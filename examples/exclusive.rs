@@ -117,10 +117,13 @@ fn report(err: &Error) {
         ErrorKind::DeviceBusy => {
             eprintln!("Another application already holds this endpoint exclusively.")
         }
-        ErrorKind::UnsupportedConfig => eprintln!(
-            "Check that \"Allow applications to take exclusive control of this device\" is \
-             enabled under this device's Sound properties."
+        ErrorKind::ExclusiveModeDenied => eprintln!(
+            "Enable \"Allow applications to take exclusive control of this device\" under this \
+             device's sound properties."
         ),
+        ErrorKind::UnsupportedConfig => {
+            eprintln!("This endpoint accepts no format CPAL can drive in exclusive mode.")
+        }
         _ => {}
     }
 }

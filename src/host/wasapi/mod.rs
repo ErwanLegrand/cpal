@@ -71,12 +71,15 @@ impl From<windows::core::Error> for Error {
 
             Audio::AUDCLNT_E_RESOURCES_INVALIDATED => ErrorKind::StreamInvalidated,
 
+            // Not a statement about the format: the user has turned exclusive-mode use of this
+            // endpoint off, and shared mode is still available.
+            Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => ErrorKind::ExclusiveModeDenied,
+
             Audio::AUDCLNT_E_UNSUPPORTED_FORMAT
             | Audio::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
             | Audio::AUDCLNT_E_BUFFER_SIZE_ERROR
             | Audio::AUDCLNT_E_INVALID_DEVICE_PERIOD
-            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_ONLY
-            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => ErrorKind::UnsupportedConfig,
+            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_ONLY => ErrorKind::UnsupportedConfig,
 
             Audio::AUDCLNT_E_WRONG_ENDPOINT_TYPE
             | Audio::AUDCLNT_E_ALREADY_INITIALIZED

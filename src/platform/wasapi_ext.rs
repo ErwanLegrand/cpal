@@ -69,8 +69,9 @@ pub enum ShareMode {
     #[default]
     Shared,
     /// The stream owns the endpoint outright, bypassing the engine's mixer and format
-    /// conversion. Only one exclusive-mode stream can exist per endpoint, and the user must
-    /// have left "Allow applications to take exclusive control of this device" enabled.
+    /// conversion. Only one exclusive-mode stream can exist per endpoint, and the user must have
+    /// left "Allow applications to take exclusive control of this device" enabled — turning it
+    /// off is reported as [`crate::ErrorKind::ExclusiveModeDenied`].
     Exclusive,
 }
 
@@ -319,8 +320,11 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
 
     /// # Errors
     ///
-    /// As [`DeviceTrait::build_input_stream_raw`]. Exclusive mode adds no error kind to that set;
-    /// three of them just arise in further circumstances:
+    /// As [`DeviceTrait::build_input_stream_raw`], and additionally:
+    ///
+    /// - [`ErrorKind::ExclusiveModeDenied`] if exclusive-mode use of the endpoint is turned off.
+    ///
+    /// Three kinds it already reports arise in further circumstances:
     ///
     /// - [`ErrorKind::UnsupportedOperation`] if this is exclusive-mode loopback capture from an
     ///   output device: loopback taps the engine mixer, which exclusive mode bypasses.
@@ -328,6 +332,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     /// - [`ErrorKind::UnsupportedConfig`] if the device does not accept `config`/`sample_format`
     ///   natively — there is no engine to convert for it.
     ///
+    /// [`ErrorKind::ExclusiveModeDenied`]: crate::ErrorKind::ExclusiveModeDenied
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
     /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
@@ -355,13 +360,17 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
 
     /// # Errors
     ///
-    /// As [`DeviceTrait::build_output_stream_raw`]. Exclusive mode adds no error kind to that set;
-    /// two of them just arise in further circumstances:
+    /// As [`DeviceTrait::build_output_stream_raw`], and additionally:
+    ///
+    /// - [`ErrorKind::ExclusiveModeDenied`] if exclusive-mode use of the endpoint is turned off.
+    ///
+    /// Two kinds it already reports arise in further circumstances:
     ///
     /// - [`ErrorKind::DeviceBusy`] if another application already holds the endpoint.
     /// - [`ErrorKind::UnsupportedConfig`] if the device does not accept `config`/`sample_format`
     ///   natively — there is no engine to convert for it.
     ///
+    /// [`ErrorKind::ExclusiveModeDenied`]: crate::ErrorKind::ExclusiveModeDenied
     /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn build_output_stream_raw<F, E>(

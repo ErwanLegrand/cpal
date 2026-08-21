@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StreamTrait::stop` ends a stream gracefully, draining buffered audio before halting (blocking up to a caller-supplied timeout). Dropping a stream still halts immediately without draining.
 - `CallbackInfo::xrun()` reports buffer over/underruns via the data callback.
+- `ErrorKind::ExclusiveModeDenied` reports exclusive use of a device being turned off in the
+  system's settings, which is not the same failure as the device being busy or the format being
+  unsupported.
 - `cpal::platform::wasapi_ext` is compiled on every platform, so asking for a WASAPI share mode
   needs no `cfg` attribute. Only the implementation behind it is Windows-only; elsewhere,
   exclusive mode is refused rather than silently downgraded.
