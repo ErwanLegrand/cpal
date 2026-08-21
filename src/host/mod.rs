@@ -11,9 +11,9 @@ pub(crate) mod equilibrium;
 
 /// Samples carried in a container wider than they are.
 ///
-/// Only WASAPI negotiates one today, but the arithmetic is plain integer work with no platform
-/// types in it, so it is compiled — and unit-tested — everywhere rather than only on Windows.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Only WASAPI negotiates one, but the arithmetic is plain integer work with no platform types in
+/// it, so the tests are built and run everywhere rather than only on Windows.
+#[cfg(any(windows, test))]
 pub(crate) mod container_align;
 
 #[cfg(windows)]
