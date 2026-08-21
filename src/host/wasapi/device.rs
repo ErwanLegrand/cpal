@@ -705,10 +705,8 @@ impl Device {
 
             // If the default format can't succeed we have no hope of finding other formats.
             //
-            // Only meaningful in shared mode: `GetMixFormat` describes the engine's mixing
-            // format, which an endpoint routinely refuses in exclusive mode (it is typically
-            // 32-bit float where the hardware is 16- or 24-bit integer). Applying this check to
-            // exclusive mode would reject devices that support exclusive mode perfectly well.
+            // Shared mode only: `GetMixFormat` describes the engine, and an endpoint routinely
+            // refuses that format in exclusive mode while supporting exclusive mode perfectly well.
             if share_mode == ShareMode::Shared
                 && !is_format_supported(client, share_mode, default_waveformatex_ptr.0)?
             {
@@ -841,9 +839,9 @@ impl Device {
     // In shared mode all samples go through an audio processor to mix them together, and one
     // format is guaranteed to be supported: the one returned by `GetMixFormat`.
     //
-    // In exclusive mode there is no mixer, so the mix format carries no such guarantee — it
-    // describes the engine, not the endpoint. There the device's channel count and sample rate
-    // are taken from the mix format but the sample format is probed for, most preferred first.
+    // In exclusive mode there is no mixer and no such guarantee: the channel count and sample
+    // rate are taken from the mix format, but the sample format is probed for, most preferred
+    // first.
     fn default_format(&self, share_mode: ShareMode) -> Result<SupportedStreamConfig, Error> {
         // initializing COM because we call `CoTaskMemFree`
         com::com_initialized();
@@ -1003,12 +1001,9 @@ impl Device {
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
 
-            // Shared mode: no further range validation, IAudioClient::Initialize accepts any
-            // positive duration. The callback period is always GetDevicePeriod() regardless of
-            // what is requested here; the value only affects ring-buffer latency.
-            //
-            // Exclusive mode: this is also the periodicity, so zero is not a legal value and
-            // `BufferSize::Default` resolves to the device's default period instead.
+            // Shared mode: this only affects ring-buffer latency, since the callback period is
+            // always GetDevicePeriod(). Exclusive mode: it is also the periodicity, so zero is
+            // not a legal value and `BufferSize::Default` resolves to the default period.
             let buffer_duration = buffer_duration_for(
                 &audio_client,
                 share_mode,
@@ -1096,11 +1091,9 @@ impl Device {
             };
 
             // WASAPI lends the capture buffer to be read, so samples arriving left-justified are
-            // shifted down into a staging buffer instead of in place. Sized once here, so the
-            // callback allocates nothing, and left empty for formats needing no shift.
-            //
-            // `i32` rather than `u8` because it reaches the callback as a `Data`, whose
-            // `as_slice` casts to the sample type, and a `Vec<u8>` guarantees no alignment.
+            // shifted down into a staging buffer instead of in place. Sized here so the callback
+            // allocates nothing; `i32` rather than `u8` because it reaches the callback as a
+            // `Data`, whose `as_slice` casts to the sample type and needs the alignment.
             let capture_scratch = if container_shift == 0 {
                 Vec::new()
             } else {
@@ -1643,10 +1636,8 @@ impl From<Audio::EDataFlow> for DeviceDirection {
 const OUTPUT_MIN_SAMPLE_RATE: SampleRate = 8_000;
 const OUTPUT_MAX_SAMPLE_RATE: SampleRate = 384_000;
 
-// Sample rate range probed in exclusive mode. Endpoint hardware runs between 8 kHz and the 768 kHz
-// of the fastest PCM converters; the DSD rates above that in `COMMON_SAMPLE_RATES` have no PCM or
-// IEEE-float encoding to ask `IsFormatSupported` about, so probing them only spends a driver
-// round-trip per sample format to be refused.
+// Sample rate range probed in exclusive mode: 8 kHz up to the fastest PCM converters. The DSD
+// rates above that in `COMMON_SAMPLE_RATES` have no PCM or IEEE-float encoding to probe with.
 const EXCLUSIVE_MIN_SAMPLE_RATE: SampleRate = 8_000;
 const EXCLUSIVE_MAX_SAMPLE_RATE: SampleRate = 768_000;
 
@@ -1669,10 +1660,7 @@ const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 7] = [
 
 // Standard speaker layouts, as documented for `KSAUDIO_CHANNEL_CONFIG`. The `windows` crate
 // exports the individual `SPEAKER_*` bits but not these combinations, so they are spelled out.
-//
-// Four and six channels each have a second documented layout (`KSAUDIO_SPEAKER_SURROUND` 0x107 and
-// `KSAUDIO_SPEAKER_5POINT1_SURROUND` 0x60F); the ones picked here are the two that nest inside the
-// eight-channel layout below. Eight channels is deliberately not `KSAUDIO_SPEAKER_7POINT1` (0xFF),
+// Eight channels is `KSAUDIO_SPEAKER_7POINT1_SURROUND` and not `KSAUDIO_SPEAKER_7POINT1` (0xFF),
 // which the same page calls obsolete and no longer supported.
 const KSAUDIO_SPEAKER_MONO: u32 = KernelStreaming::SPEAKER_FRONT_CENTER;
 const KSAUDIO_SPEAKER_STEREO: u32 =
@@ -1687,30 +1675,11 @@ const KSAUDIO_SPEAKER_7POINT1_SURROUND: u32 = KSAUDIO_SPEAKER_5POINT1
     | KernelStreaming::SPEAKER_SIDE_LEFT
     | KernelStreaming::SPEAKER_SIDE_RIGHT;
 
-// The `dwChannelMask` to advertise for `share_mode`.
-//
-// Shared mode keeps `KSAUDIO_SPEAKER_DIRECTOUT` (0), which this backend has always sent: the
-// audio engine accepts it and cpal does not care about speaker positions.
-//
-// Exclusive mode cannot keep it. The format goes to the driver rather than to the engine, and a
-// driver may reject a zero mask with `AUDCLNT_E_UNSUPPORTED_FORMAT`, indistinguishable from "this
-// endpoint has no exclusive mode at all". Measured on a PreSonus AudioBox 22VSL (USB, Windows 11):
-// 24-bit-in-a-32-bit-container at 48 kHz stereo is refused with mask 0 and accepted with
-// `SPEAKER_FRONT_LEFT|SPEAKER_FRONT_RIGHT`, every other field identical.
-//
-// Only documented layouts are emitted. Any other width falls back to `KSAUDIO_SPEAKER_DIRECTOUT`,
-// documented as rendering the first channel to the first port on the device and so on, which is
-// the truthful answer when there is no positional layout to name; inventing one risks a mask with
-// reserved bits, which is refused for a reason that has nothing to do with the device.
-//
-// The same mask must be used when probing and when initializing, or a format that
-// `IsFormatSupported` approved fails at `Initialize`. Both paths reach it through here.
-//
-// U8 and I16 go out as a plain `WAVE_FORMAT_PCM` header, whose `cbSize` of 0 stops the driver
-// reading as far as `dwChannelMask`, so for those two the mask computed here never leaves the
-// process. Spelling them `WAVE_FORMAT_EXTENSIBLE` instead would carry it, but Device Formats
-// warns that a driver may accept one spelling and refuse the other, so that trade is not made
-// blind.
+// The `dwChannelMask` to advertise for `share_mode`. Shared mode keeps
+// `KSAUDIO_SPEAKER_DIRECTOUT` (0), which the audio engine accepts; in exclusive mode the format
+// goes to the driver, which may reject a zero mask, so a documented positional layout is used
+// where one exists. Both the `IsFormatSupported` probe and `Initialize` reach the mask here, so
+// the two cannot disagree.
 fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
     match share_mode {
         ShareMode::Shared => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
@@ -1802,9 +1771,6 @@ fn config_to_waveformatextensible(
 }
 
 /// How far the negotiated format's samples must move up to sit left-justified in their container.
-///
-/// Read off the `WAVEFORMATEXTENSIBLE` handed to `Initialize` rather than off the `SampleFormat`,
-/// so the answer comes from the format's own two bit counts and no format has to be named here.
 fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
     // A plain `WAVE_FORMAT_PCM` header carries no extension for the device to read, so its
     // `wValidBitsPerSample` means nothing and the container is full by definition.
@@ -1819,12 +1785,8 @@ fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
 }
 
 // Sample formats probed against the endpoint in exclusive mode, where `GetMixFormat` answers for
-// the engine rather than for the device. I24 is included because 24-bit-in-a-32-bit-container is
-// what many audio interfaces run natively.
-//
-// `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit entries: endpoints expose 8- to 32-bit
-// containers, cpal's own ranking treats 64-bit integers as accumulator types rather than stream
-// formats, and every entry here costs a blocking driver round-trip per sample rate.
+// the engine rather than for the device. `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit
+// entries, which no endpoint exposes and which each cost a driver round-trip per sample rate.
 const EXCLUSIVE_SAMPLE_FORMATS: [SampleFormat; 5] = [
     SampleFormat::U8,
     SampleFormat::I16,
@@ -1908,10 +1870,8 @@ fn device_periods_hns(audio_client: &Audio::IAudioClient) -> Option<(i64, i64)> 
 
 /// The buffer sizes to advertise at `sample_rate` when the endpoint reports no hardware limits.
 ///
-/// A shared-mode client is scheduled at the engine's default period and does not choose its own
-/// size. An exclusive-mode client does, anywhere from the device's minimum period up to the
-/// ceiling `Initialize` documents — a bound on the request, not a promise the endpoint has the
-/// memory for it, which nothing short of calling `Initialize` will tell.
+/// A shared-mode client does not choose its own size; an exclusive-mode client does, from the
+/// device's minimum period up to the ceiling `Initialize` documents.
 fn period_buffer_size(
     periods_hns: (i64, i64),
     share_mode: ShareMode,
@@ -2048,9 +2008,13 @@ mod tests {
     // Anything outside is a channel location the documentation calls reserved.
     const DEFINED_SPEAKER_POSITIONS: u32 = 0x3_FFFF;
 
+    // Every width `channel_mask_for` distinguishes: the documented layouts, the gaps between
+    // them, and the boundaries around the defined speaker positions.
+    const CHANNEL_COUNTS: [u16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 18, 19, 31, 32, 33, u16::MAX];
+
     #[test]
     fn shared_mode_always_asks_for_directout() {
-        for channels in 0..=u16::MAX {
+        for channels in CHANNEL_COUNTS {
             assert_eq!(
                 channel_mask_for(ShareMode::Shared, channels),
                 0,
@@ -2089,7 +2053,7 @@ mod tests {
 
     #[test]
     fn exclusive_mode_masks_are_positional_and_never_reserved() {
-        for channels in 0..=u16::MAX {
+        for channels in CHANNEL_COUNTS {
             let mask = channel_mask_for(ShareMode::Exclusive, channels);
             assert_eq!(mask & !DEFINED_SPEAKER_POSITIONS, 0, "{channels}");
             // A non-zero mask must name exactly as many positions as there are channels, since

@@ -316,8 +316,7 @@ pub struct StreamInner {
     // device reads them. Zero for every format whose container is exactly full.
     pub container_shift: u32,
     // Capture only, and only when `container_shift` is non-zero: the staging buffer the samples
-    // are shifted into on their way from WASAPI's buffer to the data callback. Allocated at
-    // stream build; empty otherwise.
+    // are shifted into on their way from WASAPI's buffer to the data callback.
     pub capture_scratch: Vec<i32>,
 }
 
@@ -655,10 +654,9 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
 // playback ahead of them.
 #[inline]
 fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount), Error> {
-    // An event-driven exclusive-mode stream is handed one whole buffer per event, and the
-    // padding value is documented as carrying no useful information for that case. Both figures
-    // follow from the one-buffer-per-pass contract instead: the pass writes the whole buffer, so
-    // a whole buffer also bounds what can still be queued when `stop()` reads the fill.
+    // An event-driven exclusive-mode stream is handed one whole buffer per event, and the padding
+    // value is documented as carrying no useful information there. The pass writes the whole
+    // buffer, so a whole buffer also bounds what can still be queued when `stop()` reads the fill.
     if stream.share_mode == ShareMode::Exclusive {
         return Ok((stream.max_frames_in_buffer, stream.max_frames_in_buffer));
     }
@@ -909,10 +907,9 @@ fn process_input(
                     }
                 };
 
-                // WASAPI lends this buffer until `ReleaseBuffer` and lends it to be read: a
-                // stream whose samples arrive left-justified in a wider container is staged
-                // through `capture_scratch` on the way to the callback rather than shifted where
-                // it lies. Nothing here allocates — the staging buffer was sized at stream build.
+                // WASAPI lends this buffer to be read, so samples arriving left-justified in a
+                // wider container are staged through `capture_scratch` rather than shifted where
+                // they lie.
                 let data = if stream.container_shift == 0 {
                     buffer as *mut ()
                 } else {
@@ -1016,9 +1013,7 @@ fn process_output(
         }
 
         // The callback wrote CPAL's right-aligned samples; the device reads the container as
-        // left-justified. Move them up here: after the callback, because it is the callback's
-        // output that has to be justified, and before `ReleaseBuffer`, which is where WASAPI
-        // takes the bytes.
+        // left-justified. Move them up before `ReleaseBuffer` takes the bytes.
         if stream.container_shift != 0 {
             // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
             // `ReleaseBuffer` below; `data` is not read again.
