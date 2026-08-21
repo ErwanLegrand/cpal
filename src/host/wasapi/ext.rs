@@ -1,17 +1,24 @@
 //! The WASAPI backend's implementation of [`WasapiDeviceExt`].
 //!
-//! The trait, [`ShareMode`] and [`WasapiStreamOptions`] all live in
-//! [`crate::platform::wasapi_ext`] and are compiled on every platform; this is the half that
-//! actually reaches an endpoint, and is the only half that is Windows-only.
+//! The trait, [`ShareMode`](crate::platform::wasapi_ext::ShareMode),
+//! [`WasapiStreamOptions`] and [`WasapiConfigured`](crate::platform::wasapi_ext::WasapiConfigured)
+//! all live in [`crate::platform::wasapi_ext`] and are compiled on every platform; this is the
+//! half that actually reaches an endpoint, and is the only half that is Windows-only.
 
 use std::time::Duration;
 
 use crate::{
     CallbackInfo, Data, Error, SampleFormat, StreamConfig, SupportedStreamConfig,
-    platform::{WasapiDeviceExt, WasapiStreamOptions},
+    platform::wasapi_ext::{WasapiDeviceExt, WasapiStreamOptions, sealed::Sealed},
 };
 
-impl WasapiDeviceExt for super::Device {
+impl WasapiDeviceExt for super::Device {}
+
+impl Sealed for super::Device {
+    fn has_wasapi_endpoint(&self) -> bool {
+        true
+    }
+
     fn default_input_config_with(
         &self,
         options: WasapiStreamOptions,

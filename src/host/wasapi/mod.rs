@@ -15,7 +15,7 @@ pub use self::device::{
     reason = "re-exported for public API via platform module"
 )]
 pub use self::stream::Stream;
-pub(crate) use crate::platform::ShareMode;
+pub(crate) use crate::platform::wasapi_ext::ShareMode;
 use crate::{Error, ErrorKind, traits::HostTrait};
 
 mod device;

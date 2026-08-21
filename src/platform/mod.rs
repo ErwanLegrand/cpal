@@ -35,10 +35,9 @@ pub use crate::host::pipewire::Host as PipeWireHost;
 #[cfg(feature = "custom")]
 pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
 
+// Unconditional on purpose; see the module's own documentation. Its items are not re-exported
+// here: one public path each, in the module whose documentation explains them.
 pub mod wasapi_ext;
-
-// Unconditional on purpose; see `wasapi_ext`'s documentation.
-pub use wasapi_ext::{ShareMode, WasapiDeviceExt, WasapiStreamOptions};
 
 /// A macro to assist with implementing a platform's dynamically dispatched [`Host`] type.
 ///
