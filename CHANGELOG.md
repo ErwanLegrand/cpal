@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StreamTrait::stop` ends a stream gracefully, draining buffered audio before halting (blocking up to a caller-supplied timeout). Dropping a stream still halts immediately without draining.
 - `CallbackInfo::xrun()` reports buffer over/underruns via the data callback.
-- **AudioWorklet**: Input streams are now supported.
-- **WebAudio**: Input streams are now supported.
+- `DeviceTrait::build_duplex_stream()`, `build_duplex_stream_raw()`, and `supports_duplex()` for capture and playback from one device-level callback.
+- **AudioWorklet**: Input and duplex streams are now supported.
+- **WebAudio**: Input and duplex streams are now supported.
 
 ### Changed
 
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StreamTrait::play` is renamed to `start`.
 - `InputCallbackInfo`/`OutputCallbackInfo` merged into `CallbackInfo`.
 - `InputStreamTimestamp`/`OutputStreamTimestamp` merged into `StreamTimestamp`; `capture`/`playback` renamed `device`.
+- Renamed the `wasm-beep` and `audioworklet-beep` examples to `webaudio` and `audioworklet`.
 - **ALSA**: Update `alsa` dependency to 0.12.
 - **Linux**: `realtime` can now promote threads without requiring `realtime-dbus`.
 
@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **ALSA**: Fix a remaining timestamp segfault on 32-bit platforms with a 64-bit kernel `time_t`.
 - **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
+- **AudioWorklet**: Fix dropouts in output streams when the callback buffer grows.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
 
@@ -115,7 +118,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `realtime` feature for real-time audio thread scheduling without a D-Bus build dependency.
 - `StreamTrait::now()` to query the current instant on the stream's clock.
 - `StreamTrait::buffer_size()` to query the stream's current buffer size in frames per callback.
-- `DeviceTrait::build_duplex_stream()`, `build_duplex_stream_raw()`, and `supports_duplex()` for synchronized capture and playback on a shared clock (no backend support yet).
 - `SAMPLE_RATE_CD` (44100 Hz) and `SAMPLE_RATE_48K` (48000 Hz) constants.
 - `SupportedStreamConfigRange::try_with_standard_sample_rate()` and `with_standard_sample_rate()`
   to select 48 kHz or 44.1 kHz from a range.
