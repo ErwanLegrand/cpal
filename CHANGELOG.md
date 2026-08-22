@@ -39,10 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **ALSA**: Fix a remaining timestamp segfault on 32-bit platforms with a 64-bit kernel `time_t`.
-- **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
 - **AudioWorklet**: Fix dropouts in output streams when the callback buffer grows.
+- **AudioWorklet**: Fix processor construction failures not being reported to `error_callback`.
 - **JACK**: Channel enumeration is capped at the physical system port count again.
+- **WASAPI**: A configuration whose derived `WAVEFORMATEX` fields overflow is now rejected as `UnsupportedConfig` instead of panicking in debug builds and wrapping in release.
+- **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
+- **WASAPI**: An implausible buffer size reported by the audio client is now rejected when the stream is built, instead of becoming a huge allocation on the audio thread.
+- **WASAPI**: An oversized capture packet is now reported as a stream error instead of a panic or over-read.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+- **WASAPI**: Empty capture packets are no longer handed to the data callback as a null buffer.
+- **WASAPI**: Input streams no longer stop responding to `stop()` and `Drop` if the driver never reports an empty capture packet.
+- **WASAPI**: Output streams now report a backend error instead of panicking or underflowing when a driver reports more padding than the buffer holds.
 
 ## [0.18.2] - 2026-08-16
 
