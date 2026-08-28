@@ -200,6 +200,12 @@ On Linux, `realtime` alone promotes via `SCHED_FIFO` directly, requiring `CAP_SY
 
 Independently of RT scheduling, some systems need the user added to the `audio` group for ALSA device access via `udev` (`usermod -aG audio "$USER"`, then re-login).
 
+### WASAPI Exclusive Mode
+
+Exclusive mode hands the endpoint to a single application, so opening it fails when another application already holds it (`DeviceBusy`), or when **Allow applications to take exclusive control of this device** is unchecked in the device's properties under Windows Sound settings (`ExclusiveModeDenied`). Neither can be resolved from code: close the other application, or re-enable the checkbox, and try again.
+
+Exclusive mode also reports a different set of supported formats than shared mode, so negotiate the config on the device returned by `with_options` and build the stream from that same value. A config negotiated in exclusive mode and passed to the bare device silently opens shared mode instead. See the [exclusive example](examples/exclusive.rs).
+
 ### Build Errors
 
 If you are unable to build the library:

@@ -246,6 +246,9 @@ name = "record_wav"
 name = "synth_tones"
 
 [[example]]
+name = "exclusive"
+
+[[example]]
 name = "custom"
 required-features = ["custom"]
 
