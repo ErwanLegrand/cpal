@@ -11,12 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `StreamTrait::stop` ends a stream gracefully, draining buffered audio before halting (blocking up to a caller-supplied timeout). Dropping a stream still halts immediately without draining.
 - `CallbackInfo::xrun()` reports buffer over/underruns via the data callback.
+<<<<<<< HEAD
 - `DeviceTrait::build_duplex_stream()`, `build_duplex_stream_raw()`, `default_duplex_config()`, and `supports_duplex()` for capture and playback from one device-level callback.
 - **ALSA**: Duplex streams are now supported.
 - **AudioWorklet**: Input and duplex streams are now supported.
 - **JACK**: Duplex streams are now supported.
 - **WebAudio**: Input and duplex streams are now supported.
 - **WebAudio**: Added support for Emscripten targets via [wasm-bindgen/Emscripten integration](https://github.com/wasm-bindgen/wasm-bindgen/issues/5237).
+=======
+- `ErrorKind::ExclusiveModeDenied` reports exclusive use of a device being turned off in the
+  system's settings, which is not the same failure as the device being busy or the format being
+  unsupported.
+- `cpal::platform::wasapi_ext` is compiled on every platform, so asking for a WASAPI share mode
+  needs no `cfg` attribute. Only the implementation behind it is Windows-only; elsewhere,
+  exclusive mode is refused rather than silently downgraded.
+- **AudioWorklet**: Input streams are now supported.
+- **WASAPI**: Exclusive-mode streams and configuration queries. `WasapiDeviceExt::with_options`
+  binds a share mode to a device, and the result is a `DeviceTrait` whose queries and builders
+  answer for that mode. Callers that do not ask for a share mode are unaffected.
+- **WebAudio**: Input streams are now supported.
+>>>>>>> cd082fd (feat(wasapi): add exclusive-mode streams)
 
 ### Changed
 
@@ -58,10 +72,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **PipeWire**: Fix an empty chunk being emitted when a cycle requests no frames.
 - **PipeWire**: Fix capture reading from the wrong offset in the buffer on some devices.
 - **WASAPI**: Device enumeration no longer panics if the COM enumerator fails to initialize.
+<<<<<<< HEAD
 - **WASAPI**: Revert "Default device changes no longer report `DeviceChanged`" as it was misinformed.
 - **WASAPI**: Output streams now start with real audio immediately instead of undefined content in the render buffer.
 - **WASAPI**: A stream paused immediately after starting no longer plays silence before real audio on resume.
 - **WASAPI**: Fix `I64` and `F64` incorrectly reported as supported output formats.
+=======
+- **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
+- **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
+  hands the packet back to WASAPI on the capture error paths that used to leak it.
+- **WASAPI**: A device or audio-service failure while querying format support is now reported
+  rather than answered as an unsupported format.
+- **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
+  negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
+  `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
+>>>>>>> cd082fd (feat(wasapi): add exclusive-mode streams)
 
 ## [0.18.2] - 2026-08-16
 

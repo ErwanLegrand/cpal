@@ -6,10 +6,6 @@ use std::io::Error as IoError;
 
 use windows::Win32::Media::Audio;
 
-#[expect(
-    unused_imports,
-    reason = "re-exported for public API via platform module"
-)]
 pub use self::device::{
     Device, Devices, SupportedInputConfigs, SupportedOutputConfigs, default_input_device,
     default_output_device,
@@ -19,9 +15,11 @@ pub use self::device::{
     reason = "re-exported for public API via platform module"
 )]
 pub use self::stream::Stream;
+pub(crate) use crate::platform::wasapi_ext::ShareMode;
 use crate::{Error, ErrorKind, traits::HostTrait};
 
 mod device;
+mod ext;
 mod stream;
 
 /// The WASAPI host, the default windows host type.
@@ -73,12 +71,15 @@ impl From<windows::core::Error> for Error {
 
             Audio::AUDCLNT_E_RESOURCES_INVALIDATED => ErrorKind::StreamInvalidated,
 
+            // Not a statement about the format: the user has turned exclusive-mode use of this
+            // endpoint off, and shared mode is still available.
+            Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => ErrorKind::ExclusiveModeDenied,
+
             Audio::AUDCLNT_E_UNSUPPORTED_FORMAT
             | Audio::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
             | Audio::AUDCLNT_E_BUFFER_SIZE_ERROR
             | Audio::AUDCLNT_E_INVALID_DEVICE_PERIOD
-            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_ONLY
-            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => ErrorKind::UnsupportedConfig,
+            | Audio::AUDCLNT_E_EXCLUSIVE_MODE_ONLY => ErrorKind::UnsupportedConfig,
 
             Audio::AUDCLNT_E_WRONG_ENDPOINT_TYPE
             | Audio::AUDCLNT_E_ALREADY_INITIALIZED
