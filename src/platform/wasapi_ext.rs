@@ -239,30 +239,22 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
         self.device.id()
     }
 
-    /// Whether the device supports input *under these options*.
+    /// As [`DeviceTrait::supports_input`]: the direction an endpoint carries audio in is a
+    /// property of the endpoint, which no option here changes.
     ///
-    /// With the default options this is the device's own answer. Otherwise it is decided by
-    /// [`supported_input_configs`](Self::supported_input_configs), which in exclusive mode means
-    /// probing the endpoint rather than reading a flag.
+    /// Deciding this by whether [`supported_input_configs`](Self::supported_input_configs) comes
+    /// back non-empty would answer a different, more expensive question — in exclusive mode, one
+    /// blocking `IsFormatSupported` per candidate format — and would have to report a device that
+    /// failed to answer as one that does not support input. Whether the endpoint accepts a given
+    /// format under these options is what the configuration queries are for.
     fn supports_input(&self) -> bool {
-        if self.is_default() {
-            return self.device.supports_input();
-        }
-        self.supported_input_configs()
-            .is_ok_and(|mut configs| configs.next().is_some())
+        self.device.supports_input()
     }
 
-    /// Whether the device supports output *under these options*.
-    ///
-    /// With the default options this is the device's own answer. Otherwise it is decided by
-    /// [`supported_output_configs`](Self::supported_output_configs), which in exclusive mode means
-    /// probing the endpoint rather than reading a flag.
+    /// As [`DeviceTrait::supports_output`]. See [`supports_input`](Self::supports_input) for why
+    /// the options do not enter into it.
     fn supports_output(&self) -> bool {
-        if self.is_default() {
-            return self.device.supports_output();
-        }
-        self.supported_output_configs()
-            .is_ok_and(|mut configs| configs.next().is_some())
+        self.device.supports_output()
     }
 
     /// Whether a synchronized duplex stream is possible.
