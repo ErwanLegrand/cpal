@@ -245,14 +245,16 @@ fn format_support_from_hresult(hr: HRESULT) -> Result<bool, Error> {
         // AUDCLNT_E_UNSUPPORTED_FORMAT instead.
         Foundation::S_FALSE | Audio::AUDCLNT_E_UNSUPPORTED_FORMAT => Ok(false),
         // Not an answer about the format at all: the endpoint went away, the session's resources
-        // were reclaimed, or the audio service is not running. Reporting these as "unsupported"
-        // would empty out `supported_*_configs_with(Exclusive)`, which probes formats one by one
-        // with no other check in front of it, and turn an unplugged device into
+        // were reclaimed, the audio service is not running, or the user has turned exclusive-mode
+        // use of this endpoint off. Reporting these as "unsupported" would empty out
+        // `supported_*_configs_with(Exclusive)`, which probes formats one by one with no other
+        // check in front of it, and turn an unplugged or exclusive-denied device into
         // `UnsupportedConfig`. Propagated, they map to DeviceNotAvailable / StreamInvalidated /
-        // HostUnavailable in `impl From<windows::core::Error> for Error`.
+        // HostUnavailable / ExclusiveModeDenied in `impl From<windows::core::Error> for Error`.
         Audio::AUDCLNT_E_DEVICE_INVALIDATED
         | Audio::AUDCLNT_E_RESOURCES_INVALIDATED
-        | Audio::AUDCLNT_E_SERVICE_NOT_RUNNING => {
+        | Audio::AUDCLNT_E_SERVICE_NOT_RUNNING
+        | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
             Err(windows::core::Error::from_hresult(hr)).context("Failed to query format support")
         }
         // Anything else — a driver rejecting the struct with E_INVALIDARG, say — is about this
@@ -2089,6 +2091,12 @@ mod tests {
             (
                 Audio::AUDCLNT_E_SERVICE_NOT_RUNNING,
                 ErrorKind::HostUnavailable,
+            ),
+            // Answered when "Allow applications to take exclusive control of this device" is
+            // unchecked: shared mode still works, so this is about the device and not the format.
+            (
+                Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED,
+                ErrorKind::ExclusiveModeDenied,
             ),
         ] {
             let error = format_support_from_hresult(hr).expect_err("an error");
