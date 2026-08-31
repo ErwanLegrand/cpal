@@ -65,6 +65,37 @@ const DEFAULT_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 /// smaller than this gets that budget instead.
 const RETRY_ACTIVATION_FLOOR: Duration = Duration::from_millis(250);
 
+/// The caller's activation timeout together with the moment the stream build began.
+///
+/// The timeout is a budget for building one stream, not for each activation within it, so an
+/// activation that happens partway through — the exclusive-mode alignment retry — gets only what
+/// is left of it.
+#[derive(Clone, Copy)]
+struct ActivationBudget {
+    timeout: Option<Duration>,
+    started: Instant,
+}
+
+impl ActivationBudget {
+    fn start(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            started: Instant::now(),
+        }
+    }
+
+    /// What is left for an activation starting now. A remainder at or near zero would fail a
+    /// device that is merely slow to activate, so it is floored — never above the budget the
+    /// caller gave in the first place.
+    fn remaining(&self) -> Option<Duration> {
+        self.timeout.map(|budget| {
+            budget
+                .saturating_sub(self.started.elapsed())
+                .max(RETRY_ACTIVATION_FLOOR.min(budget))
+        })
+    }
+}
+
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
 #[derive(Clone)]
 struct IAudioClientWrapper(Audio::IAudioClient);
@@ -1003,7 +1034,9 @@ impl Device {
             // It's not actually sure that this is required, but when in doubt do it.
             com::com_initialized();
 
-            // Obtaining a `IAudioClient`.
+            // Obtaining a `IAudioClient`. The budget covers building the whole stream, so its
+            // clock starts here rather than at each activation within it.
+            let budget = ActivationBudget::start(activation_timeout);
             let audio_client = self
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
@@ -1052,7 +1085,7 @@ impl Device {
                 stream_flags,
                 buffer_duration,
                 &format_attempt,
-                activation_timeout,
+                budget,
             )?;
             let waveformatex = format_attempt.Format;
 
@@ -1130,7 +1163,9 @@ impl Device {
             // It's not actually sure that this is required, but when in doubt do it.
             com::com_initialized();
 
-            // Obtaining a `IAudioClient`.
+            // Obtaining a `IAudioClient`. The budget covers building the whole stream, so its
+            // clock starts here rather than at each activation within it.
+            let budget = ActivationBudget::start(activation_timeout);
             let audio_client = self
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
@@ -1174,7 +1209,7 @@ impl Device {
                 stream_flags,
                 buffer_duration,
                 &format_attempt,
-                activation_timeout,
+                budget,
             )?;
             let waveformatex = format_attempt.Format;
 
@@ -1246,6 +1281,10 @@ impl Device {
     /// its client unusable, so the retry activates a fresh one. Everything else is passed
     /// straight through.
     ///
+    /// `budget` must be the one the caller started before activating the client passed in, so
+    /// that what is left for the retry is measured from there and not from entry to this
+    /// function.
+    ///
     /// # Safety
     ///
     /// COM must be initialized on the calling thread.
@@ -1256,9 +1295,8 @@ impl Device {
         stream_flags: u32,
         buffer_duration: i64,
         format: &Audio::WAVEFORMATEXTENSIBLE,
-        activation_timeout: Option<Duration>,
+        budget: ActivationBudget,
     ) -> Result<Audio::IAudioClient, Error> {
-        let started = Instant::now();
         // An event-driven exclusive-mode stream must be given a periodicity, and it must equal
         // the buffer duration. Shared mode requires zero.
         let periodicity = match share_mode {
@@ -1307,16 +1345,9 @@ impl Device {
             format.Format.nSamplesPerSec,
         );
         // The caller's timeout covers building this stream, not each activation within it, so the
-        // retry gets what is left of it rather than a second full budget. A remainder at or near
-        // zero would fail a device that is merely slow to activate, so it is floored — never
-        // above the budget the caller gave in the first place.
-        let retry_timeout = activation_timeout.map(|budget| {
-            budget
-                .saturating_sub(started.elapsed())
-                .max(RETRY_ACTIVATION_FLOOR.min(budget))
-        });
+        // retry gets what is left of it rather than a second full budget.
         let audio_client = self
-            .build_audioclient(retry_timeout)
+            .build_audioclient(budget.remaining())
             .context("Failed to rebuild audio client for aligned buffer")?;
         unsafe {
             audio_client.Initialize(
@@ -1964,6 +1995,51 @@ mod tests {
     use std::cmp::Ordering;
 
     use super::*;
+
+    /// A budget of `timeout` whose stream build began `elapsed` ago.
+    fn budget_started(timeout: Option<Duration>, elapsed: Duration) -> ActivationBudget {
+        ActivationBudget {
+            timeout,
+            started: Instant::now()
+                .checked_sub(elapsed)
+                .expect("an instant that far back"),
+        }
+    }
+
+    #[test]
+    fn an_activation_that_starts_late_gets_only_what_is_left_of_the_budget() {
+        let budget = budget_started(Some(Duration::from_secs(2)), Duration::from_millis(1_500));
+        let remaining = budget.remaining().expect("a timeout");
+        // The real clock keeps running between here and `remaining()`, so the deduction can only
+        // be bounded: what matters is that the 1.5s already spent came off the 2s budget.
+        assert!(
+            remaining <= Duration::from_millis(500)
+                && remaining > Duration::from_millis(400)
+                && remaining > RETRY_ACTIVATION_FLOOR,
+            "{remaining:?}"
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_still_leaves_the_floor_to_activate_in() {
+        // What the alignment retry would see after a first activation ate the whole timeout:
+        // without the floor it would be handed zero and fail a merely slow device.
+        let budget = budget_started(Some(Duration::from_secs(2)), Duration::from_secs(9));
+        assert_eq!(budget.remaining(), Some(RETRY_ACTIVATION_FLOOR));
+    }
+
+    #[test]
+    fn the_floor_never_lifts_a_budget_above_what_the_caller_asked_for() {
+        let tiny = RETRY_ACTIVATION_FLOOR / 5;
+        let budget = budget_started(Some(tiny), Duration::from_secs(9));
+        assert_eq!(budget.remaining(), Some(tiny));
+    }
+
+    #[test]
+    fn no_timeout_stays_no_timeout_however_long_the_build_takes() {
+        let budget = budget_started(None, Duration::from_secs(9));
+        assert_eq!(budget.remaining(), None);
+    }
 
     fn container_shift_for(sample_format: SampleFormat) -> u32 {
         let config = StreamConfig {
