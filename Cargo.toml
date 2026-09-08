@@ -246,6 +246,9 @@ name = "feedback"
 name = "record_wav"
 
 [[example]]
+name = "exclusive"
+
+[[example]]
 name = "synth_tones"
 
 [[example]]

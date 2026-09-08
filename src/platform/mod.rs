@@ -35,6 +35,10 @@ pub use crate::host::pipewire::Host as PipeWireHost;
 #[cfg(feature = "custom")]
 pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
 
+// Unconditional on purpose; see the module's own documentation. Its items are not re-exported
+// here: one public path each, in the module whose documentation explains them.
+pub mod wasapi_ext;
+
 /// A macro to assist with implementing a platform's dynamically dispatched [`Host`] type.
 ///
 /// These dynamically dispatched types are necessary to allow for users to switch between hosts at
@@ -969,6 +973,22 @@ mod platform_impl {
         #[cfg(feature = "jack")] Jack "JACK" => JackHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
+
+    impl SupportedInputConfigs {
+        /// Wraps the WASAPI backend's own iterator, so [`super::WasapiDeviceExt`] can answer
+        /// with this opaque type.
+        pub(crate) fn from_wasapi(configs: crate::host::wasapi::SupportedInputConfigs) -> Self {
+            Self(SupportedInputConfigsInner::Wasapi(configs))
+        }
+    }
+
+    impl SupportedOutputConfigs {
+        /// Wraps the WASAPI backend's own iterator, so [`super::WasapiDeviceExt`] can answer
+        /// with this opaque type.
+        pub(crate) fn from_wasapi(configs: crate::host::wasapi::SupportedOutputConfigs) -> Self {
+            Self(SupportedOutputConfigsInner::Wasapi(configs))
+        }
+    }
 
     /// The default host for the current compilation target platform.
     pub fn default_host() -> Host {

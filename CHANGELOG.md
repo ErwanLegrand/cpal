@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ALSA**: Duplex streams are now supported.
 - **AudioWorklet**: Input and duplex streams are now supported.
 - **WebAudio**: Input and duplex streams are now supported.
+- `ErrorKind::ExclusiveModeDenied` reports exclusive use of a device being turned off in the
+  system's settings, which is not the same failure as the device being busy or the format being
+  unsupported.
+- `cpal::platform::wasapi_ext` is compiled on every platform, so asking for a WASAPI share mode
+  needs no `cfg` attribute. Only the implementation behind it is Windows-only; elsewhere,
+  exclusive mode is refused rather than silently downgraded.
+- **WASAPI**: Exclusive-mode streams via `WasapiDeviceExt::with_options`.
 
 ### Changed
 
@@ -60,6 +67,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: Output streams now start with real audio immediately instead of undefined content in the render buffer.
 - **WASAPI**: A stream paused immediately after starting no longer plays silence before real audio on resume.
 - **WASAPI**: Fix `I64` and `F64` incorrectly reported as supported output formats.
+- **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
+- **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
+  hands the packet back to WASAPI on the capture error paths that used to leak it.
+- **WASAPI**: A device or audio-service failure while querying format support is now reported
+  rather than answered as an unsupported format.
+- **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
+  negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
+  `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
 
 ## [0.18.2] - 2026-08-16
 
