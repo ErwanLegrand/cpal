@@ -36,7 +36,10 @@ impl StreamState {
 
 pub struct Stream {
     playback_state: Arc<AtomicU8>,
-    async_client: jack::AsyncClient<JackNotificationHandler, LocalProcessHandler>,
+    /// `None` once dropped — the stream has been handed to the detached deactivation thread
+    /// (see the `Drop` impl), and no method may be called after a drop. Option only so the
+    /// drop can move the client off the calling thread at all.
+    async_client: Option<jack::AsyncClient<JackNotificationHandler, LocalProcessHandler>>,
     // Port names are stored in order to connect them to other ports in jack automatically
     input_port_names: Box<[String]>,
     output_port_names: Box<[String]>,
@@ -121,7 +124,7 @@ impl Stream {
     /// Returns `Err` only if an individual port-connection call fails, rolling back any
     /// connections already made so the JACK graph is left unchanged.
     pub fn connect_to_system_outputs(&mut self) -> Result<(), Error> {
-        let client = self.async_client.as_client();
+        let client = self.client();
         let system_ports = client.ports(Some("system:playback_.*"), None, jack::PortFlags::empty());
         let pairs: Vec<_> = self
             .output_port_names
@@ -140,7 +143,7 @@ impl Stream {
     /// Returns `Err` only if an individual port-connection call fails, rolling back any
     /// connections already made so the JACK graph is left unchanged.
     pub fn connect_to_system_inputs(&mut self) -> Result<(), Error> {
-        let client = self.async_client.as_client();
+        let client = self.client();
         let system_ports = client.ports(Some("system:capture_.*"), None, jack::PortFlags::empty());
         let pairs: Vec<_> = system_ports
             .iter()
@@ -148,6 +151,14 @@ impl Stream {
             .zip(self.input_port_names.iter().map(String::as_str))
             .collect();
         connect_pairs(client, &pairs)
+    }
+    /// The live JACK client. `None` only after the stream has been dropped, and no method may
+    /// be called after a drop — reaching this is a double-drop bug.
+    fn client(&self) -> &jack::Client {
+        self.async_client
+            .as_ref()
+            .expect("a dropped jack stream must not be used")
+            .as_client()
     }
 }
 
@@ -217,7 +228,7 @@ where
     StreamState::Paused.store(&playback_state, Ordering::Relaxed);
     Ok(Stream {
         playback_state,
-        async_client,
+        async_client: Some(async_client),
         input_port_names: input_port_names.into_boxed_slice(),
         output_port_names: output_port_names.into_boxed_slice(),
     })
@@ -256,7 +267,7 @@ impl StreamTrait for Stream {
 
         let is_output = !self.output_port_names.is_empty();
         if is_output && timeout != Some(std::time::Duration::ZERO) {
-            let client = self.async_client.as_client();
+            let client = self.client();
             let ports: Vec<_> = self
                 .output_port_names
                 .iter()
@@ -274,14 +285,34 @@ impl StreamTrait for Stream {
     }
 
     fn now(&self) -> StreamInstant {
-        micros_to_stream_instant(self.async_client.as_client().time())
+        micros_to_stream_instant(self.client().time())
     }
 
     fn buffer_size(&self) -> Result<FrameCount, Error> {
-        Ok(self.async_client.as_client().buffer_size() as FrameCount)
+        Ok(self.client().buffer_size() as FrameCount)
     }
 }
 
+impl Drop for Stream {
+    /// Deactivates the JACK client **on a detached thread**: dropping the `AsyncClient` calls
+    /// `jack_deactivate`, which blocks the calling thread until the JACK process callback
+    /// thread acknowledges deactivation — and on Jack2/Windows that acknowledgement can take
+    /// unbounded time or never arrive (observed: namir-app's window-close hung in this call
+    /// while the sibling client kept streaming into a dead consumer). `Drop` may run on any
+    /// thread — the host app's UI thread at window close in the observed case — so it must
+    /// not block. The client stays registered until the thread finishes deactivation or the
+    /// process exits; the server reclaims a dead client's ports. One consequence: a
+    /// mid-session stream swap can briefly have the new client registered beside the old one;
+    /// JACK client names are not unique, so the new client takes over the old name and the
+    /// server kicks the old one.
+    fn drop(&mut self) {
+        if let Some(async_client) = self.async_client.take() {
+            std::thread::spawn(move || {
+                drop(async_client)
+            });
+        }
+    }
+}
 type InputDataCallback = Box<dyn FnMut(&Data, &CallbackInfo) + Send + 'static>;
 type OutputDataCallback = Box<dyn FnMut(&mut Data, &CallbackInfo) + Send + 'static>;
 type DuplexDataCallback = Box<dyn FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static>;
