@@ -28,6 +28,21 @@ pub enum ErrorKind {
     /// the device identifier refers to a device that does not exist on this system.
     DeviceNotAvailable,
 
+    /// Exclusive use of the device was refused because the system is configured not to allow it.
+    ///
+    /// The device is present and usable in shared mode: only exclusive access is denied, so a
+    /// caller that can fall back has somewhere to fall back to. On Windows this is the
+    /// "Allow applications to take exclusive control of this device" checkbox in the endpoint's
+    /// sound properties.
+    ///
+    /// Distinct from [`DeviceBusy`], where exclusive use is permitted but another application
+    /// currently holds the device, and from [`PermissionDenied`], where the process cannot reach
+    /// the device at all.
+    ///
+    /// [`DeviceBusy`]: ErrorKind::DeviceBusy
+    /// [`PermissionDenied`]: ErrorKind::PermissionDenied
+    ExclusiveModeDenied,
+
     /// The audio host (server or subsystem) is not available on this system.
     ///
     /// This is distinct from [`DeviceNotAvailable`]: when a host (e.g. PulseAudio, PipeWire, JACK,
@@ -99,6 +114,10 @@ impl Display for ErrorKind {
             ),
             Self::DeviceNotAvailable => f.write_str(
                 "The requested audio device is not available. It may have been disconnected.",
+            ),
+            Self::ExclusiveModeDenied => f.write_str(
+                "Exclusive use of the device is turned off in the system's settings. \
+                 Enable it, or open the device in shared mode.",
             ),
             Self::HostUnavailable => f.write_str(
                 "The requested audio host is not available. The subsystem or daemon may not be installed or running.",
