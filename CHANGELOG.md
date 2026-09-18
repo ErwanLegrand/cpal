@@ -84,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
 - **WASAPI**: Empty capture packets are no longer handed to the data callback as a null buffer.
 - **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
+- **WASAPI**: A configuration whose derived `WAVEFORMATEX` fields overflow is now rejected as `UnsupportedConfig` instead of panicking in debug builds and wrapping in release.
 
 ## [0.18.2] - 2026-08-16
 
