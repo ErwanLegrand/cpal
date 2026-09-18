@@ -279,13 +279,15 @@ fn format_support_from_hresult(hr: HRESULT) -> Result<bool, Error> {
         // were reclaimed, the audio service is not running, or the user has turned exclusive-mode
         // use of this endpoint off. Reporting these as "unsupported" would empty out
         // `supported_*_configs_with(Exclusive)`, which probes formats one by one with no other
-        // check in front of it, and turn an unplugged or exclusive-denied device into
+        // check in front of it, and turn an unplugged, busy, or exclusive-denied device into
         // `UnsupportedConfig`. Propagated, they map to DeviceNotAvailable / StreamInvalidated /
-        // HostUnavailable / ExclusiveModeDenied in `impl From<windows::core::Error> for Error`.
+        // HostUnavailable / ExclusiveModeDenied / DeviceBusy in
+        // `impl From<windows::core::Error> for Error`.
         Audio::AUDCLNT_E_DEVICE_INVALIDATED
         | Audio::AUDCLNT_E_RESOURCES_INVALIDATED
         | Audio::AUDCLNT_E_SERVICE_NOT_RUNNING
-        | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
+        | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
+        | Audio::AUDCLNT_E_DEVICE_IN_USE => {
             Err(windows::core::Error::from_hresult(hr)).context("Failed to query format support")
         }
         // Anything else — a driver rejecting the struct with E_INVALIDARG, say — is about this
@@ -1717,7 +1719,8 @@ fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
 // Turns a `Format` into a `WAVEFORMATEXTENSIBLE`, paired with the shift its samples need to sit
 // left-justified in the container it declares.
 //
-// Returns `None` if the WAVEFORMATEXTENSIBLE does not support the given format.
+// Returns `None` if the WAVEFORMATEXTENSIBLE does not support the given format, or if the
+// container it would ask for is padded in a way the backend cannot align.
 fn config_to_waveformatextensible(
     config: StreamConfig,
     sample_format: SampleFormat,
@@ -2144,7 +2147,6 @@ mod tests {
             // device.
             Foundation::E_INVALIDARG,
             Foundation::E_FAIL,
-            Audio::AUDCLNT_E_DEVICE_IN_USE,
         ] {
             assert!(
                 !format_support_from_hresult(hr).expect("not an error"),
@@ -2174,6 +2176,8 @@ mod tests {
                 Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED,
                 ErrorKind::ExclusiveModeDenied,
             ),
+            // Answered while another application has the endpoint open exclusively.
+            (Audio::AUDCLNT_E_DEVICE_IN_USE, ErrorKind::DeviceBusy),
         ] {
             let error = format_support_from_hresult(hr).expect_err("an error");
             assert_eq!(error.kind(), kind, "{hr:?}");
