@@ -37,6 +37,9 @@ pub(crate) fn padding_bits(container_bits: u16, valid_bits: u16) -> u32 {
         CONTAINER_BYTES * 8,
         "a padded {container_bits}-bit container is not one this module can walk",
     );
+    if container_bits as usize != CONTAINER_BYTES * 8 {
+        return 0;
+    }
     u32::from(container_bits - valid_bits)
 }
 
@@ -115,6 +118,14 @@ mod tests {
     fn a_padded_container_of_another_width_trips_the_invariant() {
         // 12-in-16: spare bits, but `left_justify` would step through it four bytes at a time.
         let _ = padding_bits(16, 12);
+    }
+
+    /// Release builds skip the debug assertion, so the runtime guard has to answer instead.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn a_padded_container_of_another_width_returns_zero_in_release() {
+        // 12-in-16: spare bits, but `left_justify` would step through it four bytes at a time.
+        assert_eq!(padding_bits(16, 12), 0);
     }
 
     #[test]
