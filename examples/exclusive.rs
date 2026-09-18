@@ -33,7 +33,11 @@ fn main() -> anyhow::Result<()> {
         let id = &device.parse().expect("failed to parse device id");
         host.device_by_id(id)
     } else {
+        // Resolve the default device to its concrete endpoint ID: WASAPI exclusive mode locks
+        // a specific hardware endpoint and cannot open virtual default-device GUIDs.
         host.default_output_device()
+            .and_then(|d| d.id().ok())
+            .and_then(|id| host.device_by_id(&id))
     }
     .ok_or_else(|| anyhow::Error::msg("failed to find output device"))?;
     println!("Output device: {}", device.id()?);
