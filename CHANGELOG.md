@@ -83,9 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
   negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
   `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
-=======
 - **WASAPI**: Empty capture packets are no longer handed to the data callback as a null buffer.
->>>>>>> claude/review-findings-qgf2al/f04-wasapi-buffer-empty-null-buffer
+=======
+- **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
+>>>>>>> claude/review-findings-qgf2al/f05-wasapi-waveformatextensible-cbsize
 
 ## [0.18.2] - 2026-08-16
 
