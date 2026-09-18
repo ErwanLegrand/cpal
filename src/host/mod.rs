@@ -259,6 +259,9 @@ pub(crate) use error_emit::try_emit_error;
         target_feature = "atomics"
     ),
 ))]
+// Only the default Windows build (wasapi-only) compiles no callers: alsa, coreaudio, jack,
+// pipewire, audioworklet are other platforms, and asio needs `feature = "asio"`.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn frames_to_duration(
     frames: crate::FrameCount,
