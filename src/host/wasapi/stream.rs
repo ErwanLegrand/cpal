@@ -940,13 +940,13 @@ fn process_input(
             let mut flags: u32 = 0;
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
-            let result = capture_client.GetBuffer(
+            capture_client.GetBuffer(
                 &mut buffer,
                 &mut frames_available,
                 &mut flags,
                 Some(&mut device_position),
                 Some(&mut qpc_position),
-            );
+            )?;
 
             match result {
                 // Documented as exclusive-mode only and transient: no packet was available, and
