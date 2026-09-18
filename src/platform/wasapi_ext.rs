@@ -122,9 +122,6 @@ pub trait WasapiDeviceExt: sealed::Sealed + Sized {
     ///   device has no WASAPI endpoint behind it. Default options are accepted by every device on
     ///   every platform.
     ///
-    /// This is the only place that refusal can happen; a `WasapiConfigured` that exists can be
-    /// asked for the mode it carries.
-    ///
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
     fn with_options(
         &self,
@@ -220,13 +217,8 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     }
 
     /// As [`DeviceTrait::supports_input`]: the direction an endpoint carries audio in is a
-    /// property of the endpoint, which no option here changes.
-    ///
-    /// Deciding this by whether [`supported_input_configs`](Self::supported_input_configs) comes
-    /// back non-empty would answer a different, more expensive question — in exclusive mode, one
-    /// blocking `IsFormatSupported` per candidate format — and would have to report a device that
-    /// failed to answer as one that does not support input. Whether the endpoint accepts a given
-    /// format under these options is what the configuration queries are for.
+    /// property of the endpoint, which no option here changes; whether it accepts a given format
+    /// under these options is what the configuration queries answer.
     fn supports_input(&self) -> bool {
         self.device.supports_input()
     }
@@ -295,19 +287,11 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     /// As [`DeviceTrait::build_input_stream_raw`], and additionally:
     ///
     /// - [`ErrorKind::ExclusiveModeDenied`] if exclusive-mode use of the endpoint is turned off.
-    ///
-    /// Three kinds it already reports arise in further circumstances:
-    ///
-    /// - [`ErrorKind::UnsupportedOperation`] if this is exclusive-mode loopback capture from an
-    ///   output device: loopback taps the engine mixer, which exclusive mode bypasses.
-    /// - [`ErrorKind::DeviceBusy`] if another application already holds the endpoint.
-    /// - [`ErrorKind::UnsupportedConfig`] if the device does not accept `config`/`sample_format`
-    ///   natively — there is no engine to convert for it.
+    /// - [`ErrorKind::UnsupportedOperation`] for exclusive-mode loopback capture from an output
+    ///   device: loopback taps the engine mixer, which exclusive mode bypasses.
     ///
     /// [`ErrorKind::ExclusiveModeDenied`]: crate::ErrorKind::ExclusiveModeDenied
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
-    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
-    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn build_input_stream_raw<F, E>(
         &self,
         config: StreamConfig,
@@ -336,15 +320,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     ///
     /// - [`ErrorKind::ExclusiveModeDenied`] if exclusive-mode use of the endpoint is turned off.
     ///
-    /// Two kinds it already reports arise in further circumstances:
-    ///
-    /// - [`ErrorKind::DeviceBusy`] if another application already holds the endpoint.
-    /// - [`ErrorKind::UnsupportedConfig`] if the device does not accept `config`/`sample_format`
-    ///   natively — there is no engine to convert for it.
-    ///
     /// [`ErrorKind::ExclusiveModeDenied`]: crate::ErrorKind::ExclusiveModeDenied
-    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
-    /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn build_output_stream_raw<F, E>(
         &self,
         config: StreamConfig,

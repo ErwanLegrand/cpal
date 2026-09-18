@@ -20,10 +20,8 @@ const CONTAINER_BYTES: usize = 4;
 ///
 /// # Panics
 ///
-/// [`left_justify`] and [`right_align_into`] step through [`CONTAINER_BYTES`] at a time, so a
-/// padded container of any other width would be shifted as if it were four bytes wide. Debug
-/// builds assert against that, and against more valid bits than the container holds; release
-/// builds answer as if the container were full, leaving the bytes untouched rather than mangled.
+/// Debug builds assert that the container is [`CONTAINER_BYTES`] wide and holds the valid bits;
+/// release builds return 0, leaving the bytes untouched.
 pub(crate) fn padding_bits(container_bits: u16, valid_bits: u16) -> u32 {
     debug_assert!(
         valid_bits <= container_bits,

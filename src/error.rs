@@ -30,10 +30,9 @@ pub enum ErrorKind {
 
     /// Exclusive use of the device was refused because the system is configured not to allow it.
     ///
-    /// The device is present and usable in shared mode: only exclusive access is denied, so a
-    /// caller that can fall back has somewhere to fall back to. On Windows this is the
-    /// "Allow applications to take exclusive control of this device" checkbox in the endpoint's
-    /// sound properties.
+    /// The device is present and usable in shared mode: only exclusive access is denied. On
+    /// Windows this is the "Allow applications to take exclusive control of this device" checkbox
+    /// in the endpoint's sound properties.
     ///
     /// Distinct from [`DeviceBusy`], where exclusive use is permitted but another application
     /// currently holds the device, and from [`PermissionDenied`], where the process cannot reach
