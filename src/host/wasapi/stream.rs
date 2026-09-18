@@ -885,6 +885,32 @@ fn process_commands_and_await_signal(
     ControlFlow::Continue(handle_idx != 0)
 }
 
+/// Releases the packet acquired via `IAudioCaptureClient::GetBuffer` on drop.
+///
+/// WASAPI requires every successful `GetBuffer` to be paired with a `ReleaseBuffer`, so the
+/// packet must be released on every path out of processing, including errors and panics.
+struct CapturePacket<'a> {
+    capture_client: &'a Audio::IAudioCaptureClient,
+    frames: u32,
+}
+
+impl CapturePacket<'_> {
+    /// Releases the packet, surfacing the failure that `Drop` would have to swallow.
+    fn release(self) -> Result<(), Error> {
+        let this = mem::ManuallyDrop::new(self);
+        unsafe { this.capture_client.ReleaseBuffer(this.frames) }
+            .context("Failed to release capture buffer")
+    }
+}
+
+impl Drop for CapturePacket<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.capture_client.ReleaseBuffer(self.frames);
+        }
+    }
+}
+
 // The loop for processing pending input data.
 fn process_input(
     stream: &StreamInner,
@@ -931,7 +957,7 @@ fn process_input(
                 Ok(_) => (),
             }
 
-            // Nothing was read, and releasing a packet of size zero is optional, so there is
+// Nothing was read, and releasing a packet of size zero is optional, so there is
             // nothing to hand back.
             if frames_available == 0 {
                 return Ok(());
@@ -945,6 +971,13 @@ fn process_input(
                 ));
             }
 
+            // The packet is released on every path out of processing, including errors and panics.
+            let packet = CapturePacket {
+                capture_client: &capture_client,
+                frames: frames_available,
+            };
+
+            let flags = flags.assume_init();
             // The discontinuity flag is undefined on the first GetBuffer after Start,
             // where device_position is still 0.
             let xrun = device_position != 0
@@ -987,10 +1020,8 @@ fn process_input(
                 data_callback(&data, &CallbackInfo { timestamp, xrun });
             }
 
-            // Release the buffer.
-            capture_client
-                .ReleaseBuffer(frames_available)
-                .context("Failed to release capture buffer")?;
+// Release the buffer, surfacing failures that `Drop` would have to swallow.
+            packet.release()?;
 
             // Shared mode drains every packet queued for this event; exclusive mode has exactly
             // one buffer per event and no packet queue to drain.
