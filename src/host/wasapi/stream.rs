@@ -1,4 +1,5 @@
 use std::{
+    mem,
     ops::ControlFlow,
     ptr, slice,
     sync::{
@@ -959,13 +960,13 @@ fn process_input(
             frames_drained = frames_drained.saturating_add(frames_available);
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
-            capture_client.GetBuffer(
+            let result = capture_client.GetBuffer(
                 &mut buffer,
                 &mut frames_available,
                 &mut flags,
                 Some(&mut device_position),
                 Some(&mut qpc_position),
-            )?;
+            );
 
             match result {
                 // Documented as exclusive-mode only and transient: no packet was available, and
@@ -996,7 +997,6 @@ fn process_input(
                 frames: frames_available,
             };
 
-            let flags = flags.assume_init();
             // The discontinuity flag is undefined on the first GetBuffer after Start,
             // where device_position is still 0.
             let xrun = device_position != 0

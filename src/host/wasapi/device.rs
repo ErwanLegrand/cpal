@@ -1224,12 +1224,6 @@ impl Device {
             )?;
             let waveformatex = format_attempt.Format;
 
-            let max_frames_in_buffer =
-                buffer_size_in_frames(&audio_client, &config, waveformatex.nBlockAlign)?;
-
-            let period_frames =
-                shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
-
             // Creating the event that will be signalled whenever we need to submit some samples.
             let event =
                 Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
@@ -2014,12 +2008,6 @@ fn buffer_size_in_frames(
         ));
     }
     Ok(max_frames_in_buffer)
-}
-
-// A driver reads as far as `cbSize` says, so the pointer has to carry provenance over the
-// whole WAVEFORMATEXTENSIBLE, not just its WAVEFORMATEX prefix.
-fn waveformatex_ptr(format: &Audio::WAVEFORMATEXTENSIBLE) -> *const Audio::WAVEFORMATEX {
-    ptr::from_ref(format).cast()
 }
 
 /// Get the default device period in frames for a shared-mode stream.
