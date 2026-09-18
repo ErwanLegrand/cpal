@@ -984,7 +984,24 @@ fn process_input(
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
             debug_assert!(!buffer.is_null());
-            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+// Every length below is derived from this frame count, and the scratch buffer is
+            // sized for a whole buffer's worth of it.
+            if frames_available > stream.max_frames_in_buffer {
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioCaptureClient::GetBuffer returned more frames than the buffer holds",
+                ));
+            }
+            // `max_frames_in_buffer` is the size the driver reported, so the product can still
+            // wrap a 32-bit `usize`.
+            let byte_count = (frames_available as usize)
+                .checked_mul(stream.bytes_per_frame as usize)
+                .ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::BackendError,
+                        "Capture packet size overflows the address space",
+                    )
+                })?;
             let len = byte_count / stream.sample_format.sample_size();
             let data = if stream.container_shift == 0 {
                 buffer.cast()
