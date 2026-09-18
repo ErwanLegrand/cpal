@@ -20,7 +20,9 @@ use super::ShareMode;
 use crate::{
     CallbackInfo, Data, Error, ErrorKind, FrameCount, ResultExt, SampleFormat, SampleRate,
     StreamConfig, StreamInstant, StreamTimestamp,
-    host::{ErrorCallbackArc, emit_error, equilibrium::fill_equilibrium, latch::Latch, container_align},
+    host::{
+        ErrorCallbackArc, container_align, emit_error, equilibrium::fill_equilibrium, latch::Latch,
+    },
     traits::StreamTrait,
 };
 
@@ -1081,7 +1083,7 @@ fn process_output(
             },
         );
 
-// The callback wrote CPAL's right-aligned samples; the device reads the container as
+        // The callback wrote CPAL's right-aligned samples; the device reads the container as
         // left-justified. Move them up before `ReleaseBuffer` takes the bytes.
         if stream.container_shift != 0 {
             // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
