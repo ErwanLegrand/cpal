@@ -2016,6 +2016,12 @@ fn buffer_size_in_frames(
     Ok(max_frames_in_buffer)
 }
 
+// A driver reads as far as `cbSize` says, so the pointer has to carry provenance over the
+// whole WAVEFORMATEXTENSIBLE, not just its WAVEFORMATEX prefix.
+fn waveformatex_ptr(format: &Audio::WAVEFORMATEXTENSIBLE) -> *const Audio::WAVEFORMATEX {
+    ptr::from_ref(format).cast()
+}
+
 /// Get the default device period in frames for a shared-mode stream.
 fn shared_mode_period_frames(
     audio_client: &Audio::IAudioClient,
