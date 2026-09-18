@@ -689,7 +689,17 @@ fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount),
             .audio_client
             .GetCurrentPadding()
             .context("Failed to get current padding")?;
-        Ok((stream.max_frames_in_buffer - padding, padding))
+        // Underflowing here would size the render buffer slice from a huge frame count.
+        let available = stream
+            .max_frames_in_buffer
+            .checked_sub(padding)
+            .ok_or_else(|| {
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioClient::GetCurrentPadding returned more frames than the buffer holds",
+                )
+            })?;
+        Ok((available, padding))
     }
 }
 

@@ -74,7 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: Output streams now start with real audio immediately instead of undefined content in the render buffer.
 - **WASAPI**: A stream paused immediately after starting no longer plays silence before real audio on resume.
 - **WASAPI**: Fix `I64` and `F64` incorrectly reported as supported output formats.
-<<<<<<< HEAD
 - **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
 - **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
   hands the packet back to WASAPI on the capture error paths that used to leak it.
@@ -84,9 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
   `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
 - **WASAPI**: Empty capture packets are no longer handed to the data callback as a null buffer.
-=======
 - **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
->>>>>>> claude/review-findings-qgf2al/f05-wasapi-waveformatextensible-cbsize
 
 ## [0.18.2] - 2026-08-16
 
