@@ -226,14 +226,6 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
     unsafe { endpoint.GetDataFlow() }.expect("could not get endpoint data_flow")
 }
 
-/// Translates the public share mode into the WASAPI constant.
-fn to_winapi_share_mode(share_mode: ShareMode) -> Audio::AUDCLNT_SHAREMODE {
-    match share_mode {
-        ShareMode::Shared => Audio::AUDCLNT_SHAREMODE_SHARED,
-        ShareMode::Exclusive => Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
-    }
-}
-
 // Given the audio client and format, returns whether the device supports it natively in
 // `share_mode`, without format conversion.
 pub unsafe fn is_format_supported(
@@ -1302,7 +1294,10 @@ impl Device {
             ShareMode::Shared => 0,
             ShareMode::Exclusive => buffer_duration,
         };
-        let mode = to_winapi_share_mode(share_mode);
+        let mode = match share_mode {
+            ShareMode::Shared => Audio::AUDCLNT_SHAREMODE_SHARED,
+            ShareMode::Exclusive => Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
+        };
         let format_ptr = waveformatex_ptr(format);
 
         let result = unsafe {

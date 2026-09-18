@@ -101,12 +101,6 @@ impl WasapiStreamOptions {
             share_mode: ShareMode::Exclusive,
         }
     }
-
-    /// Returns these options with `share_mode` replaced.
-    pub fn with_share_mode(mut self, share_mode: ShareMode) -> Self {
-        self.share_mode = share_mode;
-        self
-    }
 }
 
 /// Binds [`WasapiStreamOptions`] to a device, for the WASAPI features the cross-platform API has
