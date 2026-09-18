@@ -794,10 +794,7 @@ impl Device {
                 sample_rates.push(format.sample_rate);
             }
 
-            let sample_formats: &[SampleFormat] = match share_mode {
-                ShareMode::Shared => &WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS,
-                ShareMode::Exclusive => &EXCLUSIVE_SAMPLE_FORMATS,
-            };
+            let sample_formats = &WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS;
 
             let device_periods_hns = device_periods_hns(client);
 
@@ -1669,15 +1666,21 @@ const EXCLUSIVE_MAX_SAMPLE_RATE: SampleRate = 768_000;
 // client; longer is documented to fail with AUDCLNT_E_BUFFER_SIZE_ERROR.
 const EXCLUSIVE_MAX_BUFFER_HNS: i64 = 5_000 * 10_000;
 
-// Formats encodable as WAVEFORMATEXTENSIBLE. U8/I16 map to WAVE_FORMAT_PCM; the rest use
-// WAVE_FORMAT_EXTENSIBLE. Unsigned formats wider than 8 bits are omitted: KSDATAFORMAT_SUBTYPE_PCM
-// is always signed for 16-bit and wider, so submitting unsigned data would produce a DC offset.
+// The formats cpal probes an endpoint with, `cmp_default_heuristics` best first. U8/I16 map to
+// WAVE_FORMAT_PCM; the rest use WAVE_FORMAT_EXTENSIBLE. Unsigned formats wider than 8 bits are
+// omitted: KSDATAFORMAT_SUBTYPE_PCM is always signed for 16-bit and wider, so submitting unsigned
+// data would produce a DC offset. 64-bit formats are omitted too: no endpoint exposes them, and
+// each would cost a driver round-trip per sample rate.
+//
+// Probed in ranked order so the first accepted format — which exclusive mode stops at, and which
+// is then the default — is the one ranking `supported_*_configs_with` would pick. Shared mode
+// probes the whole list, and default selection is ranking-based either way.
 const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 5] = [
-    SampleFormat::U8,
-    SampleFormat::I16,
-    SampleFormat::I24,
-    SampleFormat::I32,
     SampleFormat::F32,
+    SampleFormat::I32,
+    SampleFormat::I24,
+    SampleFormat::I16,
+    SampleFormat::U8,
 ];
 
 // Standard speaker layouts, as documented for `KSAUDIO_CHANNEL_CONFIG`. The `windows` crate
@@ -1806,37 +1809,6 @@ fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
     container_align::padding_bits(format.Format.wBitsPerSample, valid_bits)
 }
 
-// Sample formats probed against the endpoint in exclusive mode, where `GetMixFormat` answers for
-// the engine rather than for the device. `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit
-// entries, which no endpoint exposes and which each cost a driver round-trip per sample rate.
-const EXCLUSIVE_SAMPLE_FORMATS: [SampleFormat; 5] = [
-    SampleFormat::U8,
-    SampleFormat::I16,
-    SampleFormat::I24,
-    SampleFormat::I32,
-    SampleFormat::F32,
-];
-
-/// `EXCLUSIVE_SAMPLE_FORMATS`, most preferred first.
-///
-/// Ordered by `cmp_default_heuristics` rather than by hand, so the format `default_*_config_with`
-/// settles on stays the one that ranking `supported_*_configs_with` would pick.
-fn exclusive_sample_formats_by_preference() -> [SampleFormat; EXCLUSIVE_SAMPLE_FORMATS.len()] {
-    fn ranked(sample_format: SampleFormat) -> SupportedStreamConfigRange {
-        SupportedStreamConfigRange {
-            channels: 2,
-            min_sample_rate: 48_000,
-            max_sample_rate: 48_000,
-            buffer_size: SupportedBufferSize::Unknown,
-            sample_format,
-        }
-    }
-
-    let mut formats = EXCLUSIVE_SAMPLE_FORMATS;
-    formats.sort_unstable_by(|a, b| ranked(*b).cmp_default_heuristics(&ranked(*a)));
-    formats
-}
-
 /// Finds the format the endpoint accepts in exclusive mode that cpal ranks highest, at the channel
 /// count and sample rate of the mix format.
 ///
@@ -1853,7 +1825,7 @@ unsafe fn exclusive_default_format(
     let channels = unsafe { (*mix_format).nChannels };
     let sample_rate = unsafe { (*mix_format).nSamplesPerSec };
 
-    for sample_format in exclusive_sample_formats_by_preference() {
+    for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
         let Some((waveformat, _)) = config_to_waveformatextensible(
             StreamConfig {
                 channels,
@@ -2198,7 +2170,7 @@ mod tests {
     // disagreeing with `cmp_default_heuristics` cannot pass by being wrong in both places.
     #[test]
     fn the_exclusive_probe_order_agrees_with_cmp_default_heuristics() {
-        for pair in exclusive_sample_formats_by_preference().windows(2) {
+        for pair in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS.windows(2) {
             let (preferred, next) = (pair[0], pair[1]);
             assert_eq!(
                 ranked(preferred).cmp_default_heuristics(&ranked(next)),
@@ -2210,7 +2182,10 @@ mod tests {
 
     #[test]
     fn the_exclusive_probe_set_is_every_format_narrower_than_64_bits() {
-        let mut probed = exclusive_sample_formats_by_preference();
+        let mut probed: Vec<SampleFormat> = WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS
+            .iter()
+            .copied()
+            .collect();
         probed.sort_unstable();
 
         let mut expected: Vec<SampleFormat> = WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS
