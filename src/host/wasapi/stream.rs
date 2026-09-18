@@ -794,10 +794,21 @@ fn run_output(
         }
         if run_ctxt.stream.playback_state == PlaybackState::Priming {
             if run_ctxt.stream.skip_callback.load(Ordering::Relaxed) {
-                // process_output submitted nothing this cycle; stay stopped.
+                // A pause()/stop() raced the PlayStream that entered Priming;
+                // process_output submitted nothing, and the user asked to stay stopped.
                 run_ctxt.stream.playback_state = PlaybackState::Stopped;
             } else {
-                // The buffer above just received a real fill; start now so playback begins with it.
+                // Start whether or not the pass above submitted a fill.
+                //
+                // Fill landed: the buffer leads with real audio, which is what cold-start
+                // Priming exists to guarantee. No fill — AUDCLNT_E_BUFFER_TOO_LARGE, or the
+                // shared-mode (0, _) window: per GetBuffer's contract the refusal means frames
+                // are still queued for playback, and before the first Start those can only be
+                // the real, unplayed frames a resume-from-pause preserved, so starting plays
+                // them and the next event refills. Staying in Priming to retry would stall
+                // that resume forever: the engine only frees space once the device consumes
+                // again, and the stream's event never fires before Start — the reason the
+                // Priming loop above writes the fill instead of waiting on it.
                 let start_result = unsafe { run_ctxt.stream.audio_client.Start() }
                     .context("Failed to start audio client");
                 if let Err(err) = start_result {
