@@ -930,7 +930,14 @@ fn process_input(
     scratch_buffer: &mut [i32],
 ) -> Result<(), Error> {
     unsafe {
+        // A driver whose `GetNextPacketSize` never reports an empty packet would keep
+        // `run_input` from ever polling its commands. What is left stays queued.
+        let max_frames_per_event = stream.max_frames_in_buffer.max(1);
+        let mut frames_drained: FrameCount = 0;
         loop {
+            if frames_drained >= max_frames_per_event {
+                return Ok(());
+            }
             // `GetNextPacketSize` is documented as working with shared-mode streams only, where
             // a zero packet is also what ends the drain below. An event-driven exclusive-mode
             // stream is handed one whole buffer per event and has no packet queue to size.
@@ -949,6 +956,7 @@ fn process_input(
             let mut buffer: *mut u8 = ptr::null_mut();
             let mut frames_available: u32 = 0;
             let mut flags: u32 = 0;
+            frames_drained = frames_drained.saturating_add(frames_available);
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
             capture_client.GetBuffer(
