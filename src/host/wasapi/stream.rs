@@ -976,6 +976,9 @@ fn process_input(
             let data = Data::from_parts(data, len, stream.sample_format);
 
             if !stream.skip_callback.load(Ordering::Relaxed) {
+                // `GetBuffer` opened a transaction only `ReleaseBuffer` closes, so everything
+                // from here to the callback hands the packet back before it leaves with an error.
+                //
                 // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
                 let timestamp = match input_timestamp(stream, qpc_position) {
                     Ok(timestamp) => timestamp,
@@ -1045,8 +1048,13 @@ fn process_output(
         debug_assert!(!buffer.is_null());
 
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, stream.sample_format);
+        // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
+        // `ReleaseBuffer` below. Not bound to a name, so it does not overlap the slice taken
+        // after the callback.
+        fill_equilibrium(
+            std::slice::from_raw_parts_mut(buffer, byte_count),
+            stream.sample_format,
+        );
 
         let data = buffer as *mut ();
         let len = byte_count / stream.sample_format.sample_size();

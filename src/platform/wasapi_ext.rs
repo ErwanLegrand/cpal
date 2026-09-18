@@ -51,7 +51,7 @@
 //! [`DeviceTrait`]: crate::traits::DeviceTrait
 //! [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
 
-use std::{fmt, hash, time::Duration};
+use std::{fmt, time::Duration};
 
 use crate::{
     CallbackInfo, Data, DeviceDescription, DeviceId, DuplexCallbackInfo, DuplexStreamConfig, Error,
@@ -163,6 +163,7 @@ pub trait WasapiDeviceExt: sealed::Sealed + Sized {
 /// wrapper changes is which call is the natural one to write, since the value the config was
 /// negotiated on is also the value that builds the stream. Reaching back to the device is a
 /// detour rather than the default.
+#[derive(PartialEq, Eq, Hash)]
 pub struct WasapiConfigured<'a, D> {
     device: &'a D,
     options: WasapiStreamOptions,
@@ -203,21 +204,6 @@ impl<D: fmt::Debug> fmt::Debug for WasapiConfigured<'_, D> {
 impl<D: fmt::Display> fmt::Display for WasapiConfigured<'_, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.device, f)
-    }
-}
-
-impl<D: PartialEq> PartialEq for WasapiConfigured<'_, D> {
-    fn eq(&self, other: &Self) -> bool {
-        self.options == other.options && self.device == other.device
-    }
-}
-
-impl<D: Eq> Eq for WasapiConfigured<'_, D> {}
-
-impl<D: hash::Hash> hash::Hash for WasapiConfigured<'_, D> {
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        self.device.hash(state);
-        self.options.hash(state);
     }
 }
 
