@@ -1084,12 +1084,15 @@ fn process_output(
     unsafe {
         let buffer = render_client.GetBuffer(frames_available)?;
 
-        debug_assert!(!buffer.is_null());
-
+        // Bind the packet before the assert: a failed debug assert panics, and the packet's
+        // drop is what releases the buffer back to the engine, so it must exist first. The
+        // capture side constructs its guard immediately after GetBuffer for the same reason.
         let mut packet = RenderPacket {
             render_client: &render_client,
             frames: frames_available,
         };
+
+        debug_assert!(!buffer.is_null());
 
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
         let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
