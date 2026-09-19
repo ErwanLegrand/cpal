@@ -15,11 +15,11 @@ pub use self::device::{
     reason = "re-exported for public API via platform module"
 )]
 pub use self::stream::Stream;
-pub(crate) use crate::platform::wasapi_ext::ShareMode;
+pub(crate) use crate::ShareMode;
 use crate::{Error, ErrorKind, traits::HostTrait};
 
+pub(crate) mod container_align;
 mod device;
-mod ext;
 mod stream;
 
 /// The WASAPI host, the default windows host type.

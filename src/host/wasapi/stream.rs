@@ -17,11 +17,11 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
-use super::ShareMode;
+use super::{ShareMode, container_align};
 use crate::{
     CallbackInfo, Data, Error, ErrorKind, FrameCount, ResultExt, SampleFormat, SampleRate,
     StreamConfig, StreamInstant, StreamTimestamp,
-    host::{ErrorCallbackArc, emit_error, equilibrium::fill_equilibrium, latch::Latch, container_align},
+    host::{ErrorCallbackArc, emit_error, equilibrium::fill_equilibrium, latch::Latch},
     traits::StreamTrait,
 };
 
@@ -286,8 +286,8 @@ pub enum AudioClientFlow {
 }
 
 /// Play/pause state of a [`StreamInner`]. `Priming` only ever applies to Render streams: set by
-/// a cold-start `PlayStream`, it defers `Start()` until the run loop lands a real fill in the
-/// buffer, so playback begins with actual audio instead of a silence-padded first period.
+/// a cold-start `PlayStream`, it defers `Start()` until the run loop's first output pass, so
+/// playback begins with actual audio instead of a silence-padded first period.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackState {
     #[default]
@@ -718,7 +718,9 @@ fn run_input(
     }
 
     let stream = &run_ctxt.stream;
-    let scratch_len = if stream.sample_format == SampleFormat::I24 {
+    // Mirrors the `container_shift != 0` gate in `process_input`, the only consumer of the
+    // scratch buffer, so the sizing cannot drift from the use.
+    let scratch_len = if stream.container_shift != 0 {
         // The product is checked at build time by `buffer_size_in_frames`.
         stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize / size_of::<i32>()
     } else {
@@ -806,10 +808,21 @@ fn run_output(
         }
         if run_ctxt.stream.playback_state == PlaybackState::Priming {
             if run_ctxt.stream.skip_callback.load(Ordering::Relaxed) {
-                // process_output submitted nothing this cycle; stay stopped.
+                // A pause()/stop() raced the PlayStream that entered Priming;
+                // process_output submitted nothing, and the user asked to stay stopped.
                 run_ctxt.stream.playback_state = PlaybackState::Stopped;
             } else {
-                // The buffer above just received a real fill; start now so playback begins with it.
+                // Start whether or not the pass above submitted a fill.
+                //
+                // Fill landed: the buffer leads with real audio, which is what cold-start
+                // Priming exists to guarantee. No fill — AUDCLNT_E_BUFFER_TOO_LARGE, or the
+                // shared-mode (0, _) window: per GetBuffer's contract the refusal means frames
+                // are still queued for playback, and before the first Start those can only be
+                // the real, unplayed frames a resume-from-pause preserved, so starting plays
+                // them and the next event refills. Staying in Priming to retry would stall
+                // that resume forever: the engine only frees space once the device consumes
+                // again, and the stream's event never fires before Start — the reason the
+                // Priming loop above writes the fill instead of waiting on it.
                 let start_result = unsafe { run_ctxt.stream.audio_client.Start() }
                     .context("Failed to start audio client");
                 if let Err(err) = start_result {
@@ -977,7 +990,7 @@ fn process_input(
                 Ok(_) => (),
             }
 
-// Nothing was read, and releasing a packet of size zero is optional, so there is
+            // Nothing was read, and releasing a packet of size zero is optional, so there is
             // nothing to hand back.
             if frames_available == 0 {
                 return Ok(());
@@ -1003,7 +1016,7 @@ fn process_input(
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
             debug_assert!(!buffer.is_null());
-// Every length below is derived from this frame count, and the scratch buffer is
+            // Every length below is derived from this frame count, and the scratch buffer is
             // sized for a whole buffer's worth of it.
             if frames_available > stream.max_frames_in_buffer {
                 return Err(Error::with_message(
@@ -1059,7 +1072,7 @@ fn process_input(
                 data_callback(&data, &CallbackInfo { timestamp, xrun });
             }
 
-// Release the buffer, surfacing failures that `Drop` would have to swallow.
+            // Release the buffer, surfacing failures that `Drop` would have to swallow.
             packet.release()?;
 
             // Shared mode drains every packet queued for this event; exclusive mode has exactly
@@ -1126,7 +1139,7 @@ fn process_output(
         let data = buffer as *mut ();
         let len = byte_count / stream.sample_format.sample_size();
         let mut data = Data::from_parts(data, len, stream.sample_format);
-let sample_rate = stream.config.sample_rate;
+        let sample_rate = stream.config.sample_rate;
         // The packet must not stay checked out; releasing 0 frames renders nothing.
         let timestamp =
             match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
@@ -1145,7 +1158,7 @@ let sample_rate = stream.config.sample_rate;
             },
         );
 
-// The callback wrote CPAL's right-aligned samples; the device reads the container as
+        // The callback wrote CPAL's right-aligned samples; the device reads the container as
         // left-justified. Move them up before `ReleaseBuffer` takes the bytes.
         if stream.container_shift != 0 {
             // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the

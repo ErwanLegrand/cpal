@@ -6,18 +6,17 @@
 //! client: no mixing, no format conversion, and typically a much smaller device period, at the
 //! cost of the device becoming unavailable to everything else while the stream lives.
 //!
-//! Share mode is not part of [`StreamConfig`], because it is meaningless on every other backend.
-//! It is requested through [`WasapiStreamOptions`], which [`WasapiDeviceExt::with_options`] binds
-//! to a device once. What comes back is a [`WasapiConfigured`], which implements [`DeviceTrait`]
-//! itself: the ordinary queries and builders on it answer for the options it carries, so the mode
-//! is chosen in one place rather than repeated at every call.
+//! Share mode is not part of [`StreamConfig`], because it is meaningless on every other backend;
+//! instead it is bound to a device once through [`WasapiDeviceExt::with_options`]. The resulting
+//! [`WasapiConfigured`] implements [`DeviceTrait`] itself, so the ordinary queries and builders
+//! on it answer for the chosen mode rather than repeating it at every call.
 //!
 //! ```no_run
-//! use cpal::platform::wasapi_ext::{WasapiDeviceExt, WasapiStreamOptions};
+//! use cpal::platform::wasapi_ext::{ShareMode, WasapiDeviceExt};
 //! use cpal::traits::{DeviceTrait, HostTrait};
 //!
 //! let device = cpal::default_host().default_output_device().unwrap();
-//! let exclusive = device.with_options(WasapiStreamOptions::exclusive())?;
+//! let exclusive = device.with_options(ShareMode::Exclusive)?;
 //!
 //! // Exclusive mode exposes a different set of formats, so negotiate and build on the same
 //! // configured device, in the sample format that came back.
@@ -58,65 +57,18 @@ use crate::{
     ErrorKind, SampleFormat, StreamConfig, SupportedStreamConfig, traits::DeviceTrait,
 };
 
-/// How a WASAPI stream shares its endpoint with the rest of the system.
+// Re-exported so the historical `cpal::platform::wasapi_ext::ShareMode` path keeps working; the
+// type itself lives at the crate root, outside this platform module.
+pub use crate::ShareMode;
+
+/// Binds a share mode to a device, for the WASAPI features the cross-platform API has no
+/// vocabulary for.
 ///
-/// See the [module documentation](self) for what the two modes mean in practice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ShareMode {
-    /// The Windows audio engine mixes this stream with other applications'. The default, and the
-    /// only mode any other backend has.
-    #[default]
-    Shared,
-    /// The stream owns the endpoint outright, bypassing the engine's mixer and format
-    /// conversion. Only one exclusive-mode stream can exist per endpoint, and the user must have
-    /// left "Allow applications to take exclusive control of this device" enabled — turning it
-    /// off is reported as [`crate::ErrorKind::ExclusiveModeDenied`].
-    Exclusive,
-}
-
-/// WASAPI-specific options for configuration queries and stream building.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub struct WasapiStreamOptions {
-    /// The share mode to open the endpoint in. Defaults to [`ShareMode::Shared`], which is
-    /// exactly what the cross-platform API does.
-    pub share_mode: ShareMode,
-}
-
-impl WasapiStreamOptions {
-    /// Options selecting shared mode — the default, spelled out.
-    ///
-    /// A device configured with these behaves exactly as the device itself, on every platform,
-    /// which is what makes it the option to pass when the mode is chosen at runtime.
-    pub fn shared() -> Self {
-        Self {
-            share_mode: ShareMode::Shared,
-        }
-    }
-
-    /// Options selecting exclusive mode.
-    pub fn exclusive() -> Self {
-        Self {
-            share_mode: ShareMode::Exclusive,
-        }
-    }
-
-    /// Returns these options with `share_mode` replaced.
-    pub fn with_share_mode(mut self, share_mode: ShareMode) -> Self {
-        self.share_mode = share_mode;
-        self
-    }
-}
-
-/// Binds [`WasapiStreamOptions`] to a device, for the WASAPI features the cross-platform API has
-/// no vocabulary for.
-///
-/// This trait is sealed: it is implemented for [`crate::Device`] on every platform and for the
-/// WASAPI backend's own device on Windows, and cannot be implemented outside this crate.
+/// This trait is sealed: it is implemented for [`crate::Device`] on every platform, and cannot
+/// be implemented outside this crate.
 pub trait WasapiDeviceExt: sealed::Sealed + Sized {
-    /// Binds `options` to this device, returning a [`WasapiConfigured`] whose [`DeviceTrait`]
-    /// methods answer for them.
+    /// Binds `share_mode` to this device, returning a [`WasapiConfigured`] whose [`DeviceTrait`]
+    /// methods answer for the mode.
     ///
     /// The supported-format set, the default format and the buffer size a device reports all
     /// differ between the two share modes, so this is deliberately the only way to reach the
@@ -124,35 +76,33 @@ pub trait WasapiDeviceExt: sealed::Sealed + Sized {
     ///
     /// # Errors
     ///
-    /// - [`ErrorKind::UnsupportedOperation`] if `options` are anything but the default and this
-    ///   device has no WASAPI endpoint behind it. Default options are accepted by every device on
-    ///   every platform.
+    /// - [`ErrorKind::UnsupportedOperation`] if `share_mode` is not [`ShareMode::Shared`] and
+    ///   this device has no WASAPI endpoint behind it. Shared mode is accepted by every device
+    ///   on every platform.
     ///
     /// This is the only place that refusal can happen; a `WasapiConfigured` that exists can be
     /// asked for the mode it carries.
     ///
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
-    fn with_options(
-        &self,
-        options: WasapiStreamOptions,
-    ) -> Result<WasapiConfigured<'_, Self>, Error> {
-        // Compared against the default as a whole rather than by field, so an option added to
-        // `WasapiStreamOptions` later is refused here too instead of being silently dropped.
-        if options != WasapiStreamOptions::default() && !self.has_wasapi_endpoint() {
-            return Err(unsupported_options(options));
+    fn with_options(&self, share_mode: ShareMode) -> Result<WasapiConfigured<'_, Self>, Error> {
+        if share_mode != ShareMode::Shared && !self.has_wasapi_endpoint() {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "Exclusive mode requires a WASAPI device",
+            ));
         }
         Ok(WasapiConfigured {
             device: self,
-            options,
+            share_mode,
         })
     }
 }
 
-/// A device with [`WasapiStreamOptions`] bound to it, from
+/// A device with a share mode bound to it, from
 /// [`with_options`](WasapiDeviceExt::with_options).
 ///
 /// It implements [`DeviceTrait`], so the configuration queries and stream builders are the
-/// cross-platform ones, answering for the options it carries. With the default options it behaves
+/// cross-platform ones, answering for the mode it carries. With [`ShareMode::Shared`] it behaves
 /// exactly as the device it borrows, on every platform.
 ///
 /// # Configurations still carry no share mode
@@ -163,22 +113,17 @@ pub trait WasapiDeviceExt: sealed::Sealed + Sized {
 /// wrapper changes is which call is the natural one to write, since the value the config was
 /// negotiated on is also the value that builds the stream. Reaching back to the device is a
 /// detour rather than the default.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct WasapiConfigured<'a, D> {
     device: &'a D,
-    options: WasapiStreamOptions,
+    share_mode: ShareMode,
 }
 
 impl<D> WasapiConfigured<'_, D> {
-    /// The options this device is configured with.
-    pub fn options(&self) -> WasapiStreamOptions {
-        self.options
-    }
-
-    /// Whether these options are the ones every device honours, in which case every method
-    /// forwards to the bare device unchanged.
+    /// Whether this device is configured with the mode every device honours, in which case every
+    /// method forwards to the bare device unchanged.
     fn is_default(&self) -> bool {
-        self.options == WasapiStreamOptions::default()
+        self.share_mode == ShareMode::Shared
     }
 }
 
@@ -189,15 +134,6 @@ impl<D> Clone for WasapiConfigured<'_, D> {
 }
 
 impl<D> Copy for WasapiConfigured<'_, D> {}
-
-impl<D: fmt::Debug> fmt::Debug for WasapiConfigured<'_, D> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WasapiConfigured")
-            .field("device", self.device)
-            .field("options", &self.options)
-            .finish()
-    }
-}
 
 /// The device's own name, unchanged: this is the same endpoint, and [`DeviceTrait`] documents
 /// `to_string()` as the way to get a device's name.
@@ -215,12 +151,12 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     type SupportedOutputConfigs = D::SupportedOutputConfigs;
     type Stream = D::Stream;
 
-    /// As [`DeviceTrait::description`]: the endpoint is the same one whatever the options.
+    /// As [`DeviceTrait::description`]: the endpoint is the same one whatever the share mode.
     fn description(&self) -> Result<DeviceDescription, Error> {
         self.device.description()
     }
 
-    /// As [`DeviceTrait::id`]: the endpoint is the same one whatever the options.
+    /// As [`DeviceTrait::id`]: the endpoint is the same one whatever the share mode.
     fn id(&self) -> Result<DeviceId, Error> {
         self.device.id()
     }
@@ -228,26 +164,26 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     /// As [`DeviceTrait::supports_input`]: the direction an endpoint carries audio in is a
     /// property of the endpoint, which no option here changes.
     ///
-    /// Deciding this by whether [`supported_input_configs`](Self::supported_input_configs) comes
-    /// back non-empty would answer a different, more expensive question — in exclusive mode, one
-    /// blocking `IsFormatSupported` per candidate format — and would have to report a device that
-    /// failed to answer as one that does not support input. Whether the endpoint accepts a given
-    /// format under these options is what the configuration queries are for.
+    /// Not answered by whether [`supported_input_configs`](Self::supported_input_configs) comes
+    /// back non-empty: that would be a different, more expensive question — in exclusive mode,
+    /// one blocking `IsFormatSupported` per candidate format — and would have to report a device
+    /// that failed to answer as one that does not support input. Whether the endpoint accepts a
+    /// given format under a share mode is what the configuration queries are for.
     fn supports_input(&self) -> bool {
         self.device.supports_input()
     }
 
     /// As [`DeviceTrait::supports_output`]. See [`supports_input`](Self::supports_input) for why
-    /// the options do not enter into it.
+    /// the share mode does not enter into it.
     fn supports_output(&self) -> bool {
         self.device.supports_output()
     }
 
     /// Whether a synchronized duplex stream is possible.
     ///
-    /// False for any non-default options: those options have nothing to say about a duplex
-    /// stream, so [`build_duplex_stream_raw`](Self::build_duplex_stream_raw) refuses them, and
-    /// answering the device's own capability here would promise a stream that cannot be built.
+    /// False for exclusive mode: it has nothing to say about a duplex stream, so
+    /// [`build_duplex_stream_raw`](Self::build_duplex_stream_raw) refuses it, and answering the
+    /// device's own capability here would promise a stream that cannot be built.
     fn supports_duplex(&self) -> bool {
         self.is_default() && self.device.supports_duplex()
     }
@@ -260,7 +196,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     ///
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-        self.device.supported_input_configs_with(self.options)
+        self.device.supported_input_configs_with(self.share_mode)
     }
 
     /// # Errors
@@ -271,7 +207,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     ///
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-        self.device.supported_output_configs_with(self.options)
+        self.device.supported_output_configs_with(self.share_mode)
     }
 
     /// # Errors
@@ -282,7 +218,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     ///
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        self.device.default_input_config_with(self.options)
+        self.device.default_input_config_with(self.share_mode)
     }
 
     /// # Errors
@@ -293,7 +229,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     ///
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        self.device.default_output_config_with(self.options)
+        self.device.default_output_config_with(self.share_mode)
     }
 
     /// # Errors
@@ -329,7 +265,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
         self.device.build_input_stream_raw_with(
             config,
             sample_format,
-            self.options,
+            self.share_mode,
             data_callback,
             error_callback,
             timeout,
@@ -366,7 +302,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
         self.device.build_output_stream_raw_with(
             config,
             sample_format,
-            self.options,
+            self.share_mode,
             data_callback,
             error_callback,
             timeout,
@@ -376,9 +312,9 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     /// # Errors
     ///
     /// As [`DeviceTrait::build_duplex_stream_raw`], and additionally
-    /// [`ErrorKind::UnsupportedOperation`] for any non-default options: no WASAPI share mode
-    /// offers duplex streams, and these options have nowhere to be honoured on a builder that
-    /// would otherwise open shared mode.
+    /// [`ErrorKind::UnsupportedOperation`] in exclusive mode: WASAPI has no exclusive-mode
+    /// duplex streams, and the mode has nowhere to be honoured on a builder that would otherwise
+    /// open shared mode.
     ///
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
     fn build_duplex_stream_raw<F, E>(
@@ -397,7 +333,7 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
         if !self.is_default() {
             return Err(Error::with_message(
                 ErrorKind::UnsupportedOperation,
-                "WASAPI stream options do not apply to duplex streams",
+                "Exclusive mode does not apply to duplex streams",
             ));
         }
         self.device.build_duplex_stream_raw(
@@ -411,31 +347,15 @@ impl<D: WasapiDeviceExt> DeviceTrait for WasapiConfigured<'_, D> {
     }
 }
 
-/// The invariant [`sealed::Sealed`] documents, in the one place it could be broken: options that
-/// reach a device with no WASAPI endpoint behind it are the default ones, because
+/// The invariant [`sealed::Sealed`] documents, in the one place it could be broken: a mode that
+/// reaches a device with no WASAPI endpoint behind it is the default one, because
 /// [`WasapiDeviceExt::with_options`] refused every other kind.
-fn assert_options_default(options: WasapiStreamOptions) {
+fn assert_options_default(share_mode: ShareMode) {
     debug_assert_eq!(
-        options,
-        WasapiStreamOptions::default(),
-        "non-default WASAPI options reached a device with no WASAPI endpoint",
+        share_mode,
+        ShareMode::Shared,
+        "non-default share mode reached a device with no WASAPI endpoint",
     );
-}
-
-/// The error reported when WASAPI-specific options are asked of a device with no WASAPI
-/// endpoint. Exclusive mode is named separately, being the option a caller is most likely to
-/// have asked for deliberately.
-fn unsupported_options(options: WasapiStreamOptions) -> Error {
-    if options.share_mode != ShareMode::Shared {
-        return Error::with_message(
-            ErrorKind::UnsupportedOperation,
-            "Exclusive mode requires a WASAPI device",
-        );
-    }
-    Error::with_message(
-        ErrorKind::UnsupportedOperation,
-        "These WASAPI stream options require a WASAPI device",
-    )
 }
 
 /// The WASAPI backend's own device behind a platform-dispatch one, if that is what it is.
@@ -451,7 +371,7 @@ fn wasapi_device(device: &super::Device) -> Option<&crate::host::wasapi::Device>
 pub(crate) mod sealed {
     use std::time::Duration;
 
-    use super::WasapiStreamOptions;
+    use super::ShareMode;
     use crate::{
         CallbackInfo, Data, Error, SampleFormat, StreamConfig, SupportedStreamConfig,
         traits::DeviceTrait,
@@ -461,49 +381,49 @@ pub(crate) mod sealed {
     /// seal on it.
     ///
     /// These are the operations [`WasapiConfigured`](super::WasapiConfigured) implements
-    /// [`DeviceTrait`] with. They are not public: an options-aware method that shadows a
+    /// [`DeviceTrait`] with. They are not public: a share-mode-aware method that shadows a
     /// cross-platform one is exactly the shape this API is trying not to have, and every one of
     /// them is reachable through `DeviceTrait` on a configured device.
     ///
-    /// Implementations may assume `options` have already been checked against
+    /// Implementations may assume `share_mode` has already been checked against
     /// [`has_wasapi_endpoint`](Self::has_wasapi_endpoint), because
     /// [`with_options`](super::WasapiDeviceExt::with_options) is the only way to obtain the
     /// configured device that calls them.
     pub trait Sealed: DeviceTrait {
-        /// Whether a WASAPI endpoint sits behind this device, and so whether options other than
+        /// Whether a WASAPI endpoint sits behind this device, and so whether a mode other than
         /// the default can be honoured at all.
         fn has_wasapi_endpoint(&self) -> bool;
 
-        /// [`DeviceTrait::default_input_config`] under `options`.
+        /// [`DeviceTrait::default_input_config`] under `share_mode`.
         fn default_input_config_with(
             &self,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
         ) -> Result<SupportedStreamConfig, Error>;
 
-        /// [`DeviceTrait::default_output_config`] under `options`.
+        /// [`DeviceTrait::default_output_config`] under `share_mode`.
         fn default_output_config_with(
             &self,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
         ) -> Result<SupportedStreamConfig, Error>;
 
-        /// [`DeviceTrait::supported_input_configs`] under `options`.
+        /// [`DeviceTrait::supported_input_configs`] under `share_mode`.
         fn supported_input_configs_with(
             &self,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
         ) -> Result<Self::SupportedInputConfigs, Error>;
 
-        /// [`DeviceTrait::supported_output_configs`] under `options`.
+        /// [`DeviceTrait::supported_output_configs`] under `share_mode`.
         fn supported_output_configs_with(
             &self,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
         ) -> Result<Self::SupportedOutputConfigs, Error>;
 
-        /// [`DeviceTrait::build_input_stream_raw`] under `options`.
+        /// [`DeviceTrait::build_input_stream_raw`] under `share_mode`.
         fn build_input_stream_raw_with<D, E>(
             &self,
             config: StreamConfig,
             sample_format: SampleFormat,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
             data_callback: D,
             error_callback: E,
             timeout: Option<Duration>,
@@ -512,12 +432,12 @@ pub(crate) mod sealed {
             D: FnMut(&Data, &CallbackInfo) + Send + 'static,
             E: FnMut(Error) + Send + 'static;
 
-        /// [`DeviceTrait::build_output_stream_raw`] under `options`.
+        /// [`DeviceTrait::build_output_stream_raw`] under `share_mode`.
         fn build_output_stream_raw_with<D, E>(
             &self,
             config: StreamConfig,
             sample_format: SampleFormat,
-            options: WasapiStreamOptions,
+            share_mode: ShareMode,
             data_callback: D,
             error_callback: E,
             timeout: Option<Duration>,
@@ -544,55 +464,55 @@ impl sealed::Sealed for super::Device {
 
     fn default_input_config_with(
         &self,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
     ) -> Result<SupportedStreamConfig, Error> {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
-            return device.default_input_config_with(options);
+            return device.default_input_config_for(share_mode);
         }
-        // Not a WASAPI endpoint, so the options are the default ones and the cross-platform
-        // method is exactly what they mean. See `sealed::Sealed`.
-        assert_options_default(options);
+        // Not a WASAPI endpoint, so the mode is the default one and the cross-platform method is
+        // exactly what it means. See `sealed::Sealed`.
+        assert_options_default(share_mode);
         DeviceTrait::default_input_config(self)
     }
 
     fn default_output_config_with(
         &self,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
     ) -> Result<SupportedStreamConfig, Error> {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
-            return device.default_output_config_with(options);
+            return device.default_output_config_for(share_mode);
         }
-        assert_options_default(options);
+        assert_options_default(share_mode);
         DeviceTrait::default_output_config(self)
     }
 
     fn supported_input_configs_with(
         &self,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
     ) -> Result<Self::SupportedInputConfigs, Error> {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
             return device
-                .supported_input_configs_with(options)
+                .supported_input_configs_for(share_mode)
                 .map(super::SupportedInputConfigs::from_wasapi);
         }
-        assert_options_default(options);
+        assert_options_default(share_mode);
         DeviceTrait::supported_input_configs(self)
     }
 
     fn supported_output_configs_with(
         &self,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
     ) -> Result<Self::SupportedOutputConfigs, Error> {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
             return device
-                .supported_output_configs_with(options)
+                .supported_output_configs_for(share_mode)
                 .map(super::SupportedOutputConfigs::from_wasapi);
         }
-        assert_options_default(options);
+        assert_options_default(share_mode);
         DeviceTrait::supported_output_configs(self)
     }
 
@@ -600,7 +520,7 @@ impl sealed::Sealed for super::Device {
         &self,
         config: StreamConfig,
         sample_format: SampleFormat,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
@@ -612,17 +532,17 @@ impl sealed::Sealed for super::Device {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
             return device
-                .build_input_stream_raw_with(
+                .build_input_stream_raw_for(
                     config,
                     sample_format,
-                    options,
+                    share_mode,
                     data_callback,
                     error_callback,
                     timeout,
                 )
                 .map(Into::into);
         }
-        assert_options_default(options);
+        assert_options_default(share_mode);
         DeviceTrait::build_input_stream_raw(
             self,
             config,
@@ -637,7 +557,7 @@ impl sealed::Sealed for super::Device {
         &self,
         config: StreamConfig,
         sample_format: SampleFormat,
-        options: WasapiStreamOptions,
+        share_mode: ShareMode,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
@@ -649,17 +569,17 @@ impl sealed::Sealed for super::Device {
         #[cfg(windows)]
         if let Some(device) = wasapi_device(self) {
             return device
-                .build_output_stream_raw_with(
+                .build_output_stream_raw_for(
                     config,
                     sample_format,
-                    options,
+                    share_mode,
                     data_callback,
                     error_callback,
                     timeout,
                 )
                 .map(Into::into);
         }
-        assert_options_default(options);
+        assert_options_default(share_mode);
         DeviceTrait::build_output_stream_raw(
             self,
             config,

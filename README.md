@@ -167,6 +167,14 @@ If you receive errors about no default input or output device:
 - **Mobile (iOS/Android):** Ensure your app has microphone/audio permissions
 - **Windows:** Verify your audio device is enabled in Sound Settings
 
+## Windows
+
+### WASAPI Exclusive Mode
+
+Exclusive mode hands the endpoint to a single application, so opening it fails when another application already holds it (`DeviceBusy`), or when **Allow applications to take exclusive control of this device** is unchecked in the device's properties under Windows Sound settings (`ExclusiveModeDenied`). Neither can be resolved from code: close the other application, or re-enable the checkbox, and try again.
+
+Exclusive mode also reports a different set of supported formats than shared mode, so negotiate the config on the device returned by `with_options(ShareMode::Exclusive)` and build the stream from that same value. A config negotiated in exclusive mode and passed to the bare device silently opens shared mode instead. See the [exclusive example](examples/exclusive.rs).
+
 ## ALSA, PipeWire, and PulseAudio
 
 When PipeWire or PulseAudio is running, it holds the ALSA `default` device exclusively. A second stream attempting to open it via the ALSA host will fail with a `DeviceBusy` error. To route audio through the sound server via ALSA, use the bridge devices `pipewire` or `pulse` instead of `default`. Better yet, use the `pipewire` or `pulseaudio` cpal features for native integration.
@@ -206,12 +214,6 @@ RT promotion is only attempted for a whitelist of PCM types: direct hardware PCM
 On Linux, `realtime` alone promotes via `SCHED_FIFO` directly, requiring `CAP_SYS_NICE`, root, or an `rtprio` limit granted in `limits.conf` (e.g. `@audio - rtprio 95`) or systemd's `LimitRTPRIO`. Use `realtime-dbus` instead to have `rtkit` arrange this over D-Bus, without manual configuration.
 
 Independently of RT scheduling, some systems need the user added to the `audio` group for ALSA device access via `udev` (`usermod -aG audio "$USER"`, then re-login).
-
-### WASAPI Exclusive Mode
-
-Exclusive mode hands the endpoint to a single application, so opening it fails when another application already holds it (`DeviceBusy`), or when **Allow applications to take exclusive control of this device** is unchecked in the device's properties under Windows Sound settings (`ExclusiveModeDenied`). Neither can be resolved from code: close the other application, or re-enable the checkbox, and try again.
-
-Exclusive mode also reports a different set of supported formats than shared mode, so negotiate the config on the device returned by `with_options` and build the stream from that same value. A config negotiated in exclusive mode and passed to the bare device silently opens shared mode instead. See the [exclusive example](examples/exclusive.rs).
 
 ### Build Errors
 
