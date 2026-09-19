@@ -205,11 +205,6 @@ pub unsafe fn is_format_supported(
     Ok(hr.0 == 0)
 }
 
-// Get a cpal Format from a WAVEFORMATEX.
-//
-// Safety: `waveformatex_ptr` must point to a readable `WAVEFORMATEX` followed by the
-// `cbSize` extra bytes its header declares.
-//
 // Bytes that follow the `WAVEFORMATEX` header inside a `WAVEFORMATEXTENSIBLE`. The Windows ABI
 // fixes this at 22; the assert pins the size derivation below to the ABI value.
 const WAVEFORMATEXTENSIBLE_EXTRA_BYTES: u16 = 22;
@@ -218,6 +213,10 @@ const _: () = assert!(
         == WAVEFORMATEXTENSIBLE_EXTRA_BYTES as usize
 );
 
+// Get a cpal Format from a WAVEFORMATEX.
+//
+// Safety: `waveformatex_ptr` must point to a readable `WAVEFORMATEX` followed by the
+// `cbSize` extra bytes its header declares.
 unsafe fn format_from_waveformatex_ptr(
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
     audio_client: &Audio::IAudioClient,
