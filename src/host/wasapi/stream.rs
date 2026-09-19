@@ -962,6 +962,32 @@ fn process_input(
     }
 }
 
+/// Releases the packet acquired via `IAudioRenderClient::GetBuffer` on drop.
+///
+/// WASAPI requires every successful `GetBuffer` to be paired with a `ReleaseBuffer`, so the
+/// packet must be released on every path out of processing, including errors and panics.
+struct RenderPacket<'a> {
+    render_client: &'a Audio::IAudioRenderClient,
+    frames: u32,
+}
+
+impl RenderPacket<'_> {
+    /// Releases the packet, surfacing the failure that `Drop` would have to swallow.
+    fn release(self) -> Result<(), Error> {
+        let this = mem::ManuallyDrop::new(self);
+        unsafe { this.render_client.ReleaseBuffer(this.frames, 0) }
+            .context("Failed to release render buffer")
+    }
+}
+
+impl Drop for RenderPacket<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.render_client.ReleaseBuffer(self.frames, 0);
+        }
+    }
+}
+
 // The loop for writing output data.
 fn process_output(
     stream: &StreamInner,
@@ -998,6 +1024,11 @@ fn process_output(
 
         debug_assert!(!buffer.is_null());
 
+        let mut packet = RenderPacket {
+            render_client: &render_client,
+            frames: frames_available,
+        };
+
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
         let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
         fill_equilibrium(buffer_slice, stream.sample_format);
@@ -1006,7 +1037,15 @@ fn process_output(
         let len = byte_count / stream.sample_format.sample_size();
         let mut data = Data::from_parts(data, len, stream.sample_format);
         let sample_rate = stream.config.sample_rate;
-        let timestamp = output_timestamp(stream, sample_rate, clock_frequency, *frames_written)?;
+        let timestamp =
+            match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
+                Ok(timestamp) => timestamp,
+                Err(err) => {
+                    // Release the packet without presenting the unwritten buffer.
+                    packet.frames = 0;
+                    return Err(err);
+                }
+            };
         // WASAPI exposes no render-side xrun signal.
         data_callback(
             &mut data,
@@ -1028,7 +1067,7 @@ fn process_output(
             }
         }
 
-        render_client.ReleaseBuffer(frames_available, 0)?;
+        packet.release()?;
 
         *frames_written += frames_available as u64;
     }
