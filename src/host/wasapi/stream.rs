@@ -706,13 +706,12 @@ fn run_input(
     }
 
     let stream = &run_ctxt.stream;
-    let scratch_len = if stream.sample_format == SampleFormat::I24 {
-        // The product is checked at build time by `buffer_size_in_frames`.
-        stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize / size_of::<i32>()
-    } else {
-        // The scratch buffer won't be used in this case.
-        0 // Vec::with_capacity(0) does not allocate.
-    };
+    // Sized for a whole buffer's worth of frames, in bytes. The scratch serves two purposes:
+    // the I24 conversion shifts every sample through it, and packets the engine marks SILENT
+    // are served from it filled with zeros -- filling the engine's capture buffer in place
+    // would break the contract that it is read-only to the client. A zero length allocates
+    // no backing storage.
+    let scratch_len = stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize;
     let mut scratch_buffer = vec![0; scratch_len].into_boxed_slice();
 
     loop {
@@ -916,7 +915,7 @@ fn process_input(
     stream: &StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &CallbackInfo),
-    scratch_buffer: &mut [i32],
+    scratch_buffer: &mut [u8],
 ) -> Result<(), Error> {
     unsafe {
         // `GetNextPacketSize` is implemented by the audio engine and reports an empty packet
@@ -983,20 +982,21 @@ fn process_input(
             }
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
             // A packet marked SILENT may hold uninitialized data: the engine is not required to
-            // have written it. Fill silence now so the callback and the i24 copy see zeros, not
-            // stale driver memory.
-            if flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                fill_equilibrium(
-                    slice::from_raw_parts_mut(buffer.cast::<u8>(), byte_count),
-                    stream.sample_format,
-                );
-            }
-            let data = if stream.sample_format == SampleFormat::I24 {
+            // have written it. Fill equilibrium into the scratch buffer and serve that instead,
+            // so the callback and the i24 copy see zeros, not stale driver memory -- and the
+            // engine-owned capture buffer stays untouched, as required below.
+            let silent = flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            let data = if silent {
+                let zeros = &mut scratch_buffer[..byte_count];
+                fill_equilibrium(zeros, stream.sample_format);
+                zeros.as_mut_ptr().cast()
+            } else if stream.sample_format == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
                 let sample_count = byte_count / size_of::<i32>();
                 let source_data = slice::from_raw_parts(buffer.cast(), sample_count);
-                // use a scratch buffer since the capture buffer isn't meant to be written
-                let dst = &mut scratch_buffer[..sample_count];
+                // Use a scratch buffer since the capture buffer isn't meant to be written.
+                let src = &mut scratch_buffer[..byte_count];
+                let dst = slice::from_raw_parts_mut(src.as_mut_ptr().cast::<i32>(), sample_count);
                 dst.copy_from_slice(source_data);
                 for sample in dst.iter_mut() {
                     // On signed integers, >> is an arithmetic shift,
