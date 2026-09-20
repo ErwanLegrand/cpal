@@ -1,5 +1,4 @@
 use std::{
-    mem,
     ops::ControlFlow,
     ptr, slice,
     sync::{
@@ -17,6 +16,7 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
+use super::{ShareMode, container_align};
 use crate::{
     CallbackInfo, Data, Error, ErrorKind, FrameCount, ResultExt, SampleFormat, SampleRate,
     StreamConfig, StreamInstant, StreamTimestamp,
@@ -285,8 +285,8 @@ pub enum AudioClientFlow {
 }
 
 /// Play/pause state of a [`StreamInner`]. `Priming` only ever applies to Render streams: set by
-/// a cold-start `PlayStream`, it defers `Start()` until the run loop lands a real fill in the
-/// buffer, so playback begins with actual audio instead of a silence-padded first period.
+/// a cold-start `PlayStream`, it defers `Start()` until the run loop's first output pass, so
+/// playback begins with actual audio instead of a silence-padded first period.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlaybackState {
     #[default]
@@ -313,12 +313,17 @@ pub struct StreamInner {
     pub config: StreamConfig,
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
+    // The share mode the endpoint was opened in. Governs how the buffer is serviced.
+    pub share_mode: ShareMode,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
     // Raised by `stop()` and `pause()` so the audio loop skips the user callback.
     pub skip_callback: Arc<AtomicBool>,
     // Updated each output callback: latency + current buffer fill in microseconds.
     pub fill_usec: Arc<AtomicU64>,
+    // Bits the samples must move up to sit left-justified in the negotiated container, as the
+    // device reads them. Zero for every format whose container is exactly full.
+    pub container_shift: u32,
 }
 
 impl Stream {
@@ -593,7 +598,8 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
                     // and may already hold real, unplayed data.
                     let cold_start = match run_context.stream.client_flow {
                         AudioClientFlow::Render { .. } => {
-                            get_available_frames(&run_context.stream)? > 0
+                            let (available, _) = render_buffer_state(&run_context.stream)?;
+                            available > 0
                         }
                         AudioClientFlow::Capture { .. } => false,
                     };
@@ -668,15 +674,22 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
     Ok(handle_idx)
 }
 
-// Get the number of available frames that are available for writing/reading.
+// Frames the render buffer can accept this pass, paired with the frames already queued for
+// playback ahead of them.
 #[inline]
-fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
+fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount), Error> {
+    // An event-driven exclusive-mode stream is handed one whole buffer per event, and the padding
+    // value is documented as carrying no useful information there. The pass writes the whole
+    // buffer, so a whole buffer also bounds what can still be queued when `stop()` reads the fill.
+    if stream.share_mode == ShareMode::Exclusive {
+        return Ok((stream.max_frames_in_buffer, stream.max_frames_in_buffer));
+    }
     unsafe {
         let padding = stream
             .audio_client
             .GetCurrentPadding()
             .context("Failed to get current padding")?;
-        Ok(stream.max_frames_in_buffer - padding)
+        Ok((stream.max_frames_in_buffer - padding, padding))
     }
 }
 
@@ -694,7 +707,10 @@ fn run_input(
     }
 
     let stream = &run_ctxt.stream;
-    let scratch_len = if stream.sample_format == SampleFormat::I24 {
+    // Mirrors the `container_shift != 0` gate in `process_input`, the only consumer of the
+    // scratch buffer, so the sizing cannot drift from the use.
+    let scratch_len = if stream.container_shift != 0 {
+        // The product is checked at build time by `buffer_size_in_frames`.
         stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize / size_of::<i32>()
     } else {
         // The scratch buffer won't be used in this case.
@@ -781,10 +797,21 @@ fn run_output(
         }
         if run_ctxt.stream.playback_state == PlaybackState::Priming {
             if run_ctxt.stream.skip_callback.load(Ordering::Relaxed) {
-                // process_output submitted nothing this cycle; stay stopped.
+                // A pause()/stop() raced the PlayStream that entered Priming;
+                // process_output submitted nothing, and the user asked to stay stopped.
                 run_ctxt.stream.playback_state = PlaybackState::Stopped;
             } else {
-                // The buffer above just received a real fill; start now so playback begins with it.
+                // Start whether or not the pass above submitted a fill.
+                //
+                // Fill landed: the buffer leads with real audio, which is what cold-start
+                // Priming exists to guarantee. No fill — AUDCLNT_E_BUFFER_TOO_LARGE, or the
+                // shared-mode (0, _) window: per GetBuffer's contract the refusal means frames
+                // are still queued for playback, and before the first Start those can only be
+                // the real, unplayed frames a resume-from-pause preserved, so starting plays
+                // them and the next event refills. Staying in Priming to retry would stall
+                // that resume forever: the engine only frees space once the device consumes
+                // again, and the stream's event never fires before Start — the reason the
+                // Priming loop above writes the fill instead of waiting on it.
                 let start_result = unsafe { run_ctxt.stream.audio_client.Start() }
                     .context("Failed to start audio client");
                 if let Err(err) = start_result {
@@ -880,64 +907,117 @@ fn process_input(
     scratch_buffer: &mut [i32],
 ) -> Result<(), Error> {
     unsafe {
-        // Get the available data in the shared buffer.
-        let mut buffer: *mut u8 = ptr::null_mut();
-        let mut flags = mem::MaybeUninit::uninit();
         loop {
-            let mut frames_available = match capture_client.GetNextPacketSize() {
-                Ok(0) => return Ok(()),
-                Ok(f) => f,
-                Err(err) => return Err(Error::from(err)),
-            };
+            // `GetNextPacketSize` is documented as working with shared-mode streams only, where
+            // a zero packet is also what ends the drain below. An event-driven exclusive-mode
+            // stream is handed one whole buffer per event and has no packet queue to size.
+            if stream.share_mode == ShareMode::Shared {
+                match capture_client.GetNextPacketSize() {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => (),
+                    Err(err) => return Err(Error::from(err)),
+                }
+            }
+
+            // `GetBuffer` writes all of these, but a success code is not a promise that it did:
+            // `AUDCLNT_S_BUFFER_EMPTY` arrives here as `Ok` having written nothing. Clearing them
+            // every pass is what makes the checks below able to tell that apart from a packet,
+            // rather than reading back whatever the previous, already-released packet left.
+            let mut buffer: *mut u8 = ptr::null_mut();
+            let mut frames_available: u32 = 0;
+            let mut flags: u32 = 0;
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
             let result = capture_client.GetBuffer(
                 &mut buffer,
                 &mut frames_available,
-                flags.as_mut_ptr(),
+                &mut flags,
                 Some(&mut device_position),
                 Some(&mut qpc_position),
             );
 
             match result {
-                // TODO: Can this happen?
-                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
+                // Documented as exclusive-mode only and transient: no packet was available, and
+                // the consuming thread is to wait for the next processing pass rather than treat
+                // this as fatal.
+                Err(e) if e.code() == Audio::AUDCLNT_E_BUFFER_ERROR => return Ok(()),
                 Err(e) => return Err(Error::from(e)),
                 Ok(_) => (),
             }
 
-            let flags = flags.assume_init();
+            // Nothing was read, and releasing a packet of size zero is optional, so there is
+            // nothing to hand back.
+            if frames_available == 0 {
+                return Ok(());
+            }
+            // A packet of any other size has to be released even when it cannot be read.
+            if buffer.is_null() {
+                let _ = capture_client.ReleaseBuffer(frames_available);
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "Capture packet has a non-zero frame count but no data",
+                ));
+            }
+
             // The discontinuity flag is undefined on the first GetBuffer after Start,
             // where device_position is still 0.
             let xrun = device_position != 0
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
             debug_assert!(!buffer.is_null());
-            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-            let data = if stream.sample_format == SampleFormat::I24 {
-                // WASAPI stores i24 in the upper bits
-                let source_data =
-                    slice::from_raw_parts(buffer.cast(), byte_count / size_of::<i32>());
-                // use a scratch buffer since the capture buffer isn't meant to be written
-                let dst = &mut scratch_buffer[..source_data.len()];
-                dst.copy_from_slice(source_data);
-                for sample in dst.iter_mut() {
-                    // On signed integers, >> is an arithmetic shift,
-                    // which ensures the correct upper bits get shifted in
-                    *sample >>= 8;
-                }
-
-                dst.as_mut_ptr().cast()
-            } else {
-                buffer.cast()
-            };
-
+            // Every length below is derived from this frame count, and the scratch buffer is
+            // sized for a whole buffer's worth of it.
+            if frames_available > stream.max_frames_in_buffer {
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioCaptureClient::GetBuffer returned more frames than the buffer holds",
+                ));
+            }
+            // `max_frames_in_buffer` is the size the driver reported, so the product can still
+            // wrap a 32-bit `usize`.
+            let byte_count = (frames_available as usize)
+                .checked_mul(stream.bytes_per_frame as usize)
+                .ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::BackendError,
+                        "Capture packet size overflows the address space",
+                    )
+                })?;
             let len = byte_count / stream.sample_format.sample_size();
+            let data = if stream.container_shift == 0 {
+                buffer.cast()
+            } else {
+                // Only a four-byte container is ever shifted, so one container is one sample.
+                debug_assert_eq!(stream.sample_format.sample_size(), size_of::<i32>());
+                if len > scratch_buffer.len() {
+                    let _ = capture_client.ReleaseBuffer(frames_available);
+                    return Err(Error::with_message(
+                        ErrorKind::BackendError,
+                        "Capture packet is larger than the endpoint buffer holding it",
+                    ));
+                }
+                let shift = stream.container_shift;
+                let scratch = &mut scratch_buffer[..len];
+                // SAFETY: `buffer` is WASAPI's packet, valid for `byte_count` bytes until the
+                // `ReleaseBuffer` below, and a separate allocation from the staging buffer.
+                let packet = slice::from_raw_parts(buffer, byte_count);
+                container_align::right_align_into(packet, scratch, shift);
+                scratch.as_mut_ptr() as *mut ()
+            };
             let data = Data::from_parts(data, len, stream.sample_format);
 
             if !stream.skip_callback.load(Ordering::Relaxed) {
+                // `GetBuffer` opened a transaction only `ReleaseBuffer` closes, so everything
+                // from here to the callback hands the packet back before it leaves with an error.
+                //
                 // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
-                let timestamp = input_timestamp(stream, qpc_position)?;
+                let timestamp = match input_timestamp(stream, qpc_position) {
+                    Ok(timestamp) => timestamp,
+                    Err(err) => {
+                        let _ = capture_client.ReleaseBuffer(frames_available);
+                        return Err(err);
+                    }
+                };
                 data_callback(&data, &CallbackInfo { timestamp, xrun });
             }
 
@@ -945,6 +1025,12 @@ fn process_input(
             capture_client
                 .ReleaseBuffer(frames_available)
                 .context("Failed to release capture buffer")?;
+
+            // Shared mode drains every packet queued for this event; exclusive mode has exactly
+            // one buffer per event and no packet queue to drain.
+            if stream.share_mode == ShareMode::Exclusive {
+                return Ok(());
+            }
         }
     }
 }
@@ -957,14 +1043,12 @@ fn process_output(
     clock_frequency: u64,
     frames_written: &mut u64,
 ) -> Result<(), Error> {
-    // The number of frames available for writing.
-    let frames_available = match get_available_frames(stream)? {
-        0 => return Ok(()), // TODO: Can this happen?
-        n => n,
+    let (frames_available, frames_queued) = match render_buffer_state(stream)? {
+        (0, _) => return Ok(()), // TODO: Can this happen?
+        state => state,
     };
 
-    let padding = stream.max_frames_in_buffer - frames_available;
-    let fill_usec = (padding as u64)
+    let fill_usec = (frames_queued as u64)
         .saturating_mul(1_000_000)
         .saturating_div(stream.config.sample_rate as u64)
         .saturating_add(
@@ -982,19 +1066,40 @@ fn process_output(
     }
 
     unsafe {
-        let buffer = render_client.GetBuffer(frames_available)?;
+        // An exclusive-mode stream asks for the whole buffer every pass, with no padding
+        // subtraction to shrink the request, so a wake that arrives before the engine has
+        // released it is refused rather than served. Transient, and the next event retries: the
+        // capture side treats `AUDCLNT_E_BUFFER_ERROR` the same way.
+        let buffer = match render_client.GetBuffer(frames_available) {
+            Ok(buffer) => buffer,
+            Err(e) if e.code() == Audio::AUDCLNT_E_BUFFER_TOO_LARGE => return Ok(()),
+            Err(e) => return Err(Error::from(e)),
+        };
 
         debug_assert!(!buffer.is_null());
 
         let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, stream.sample_format);
+        // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
+        // `ReleaseBuffer` below. Not bound to a name, so it does not overlap the slice taken
+        // after the callback.
+        fill_equilibrium(
+            std::slice::from_raw_parts_mut(buffer, byte_count),
+            stream.sample_format,
+        );
 
         let data = buffer as *mut ();
         let len = byte_count / stream.sample_format.sample_size();
         let mut data = Data::from_parts(data, len, stream.sample_format);
         let sample_rate = stream.config.sample_rate;
-        let timestamp = output_timestamp(stream, sample_rate, clock_frequency, *frames_written)?;
+        // The packet must not stay checked out; releasing 0 frames renders nothing.
+        let timestamp =
+            match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
+                Ok(timestamp) => timestamp,
+                Err(err) => {
+                    let _ = render_client.ReleaseBuffer(0, 0);
+                    return Err(err);
+                }
+            };
         // WASAPI exposes no render-side xrun signal.
         data_callback(
             &mut data,
@@ -1004,16 +1109,13 @@ fn process_output(
             },
         );
 
-        if stream.sample_format == SampleFormat::I24 {
-            // WASAPI stores i24 in the upper bits
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "WASAPI guarantees the buffer to be aligned to a frame boundary"
-            )]
-            let buffer_slice_i32 = slice::from_raw_parts_mut(buffer.cast::<i32>(), len);
-            for sample in buffer_slice_i32 {
-                *sample <<= 8;
-            }
+        // The callback wrote CPAL's right-aligned samples; the device reads the container as
+        // left-justified. Move them up before `ReleaseBuffer` takes the bytes.
+        if stream.container_shift != 0 {
+            // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
+            // `ReleaseBuffer` below; `data` is not read again.
+            let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
+            container_align::left_justify(buffer_slice, stream.container_shift);
         }
 
         render_client.ReleaseBuffer(frames_available, 0)?;

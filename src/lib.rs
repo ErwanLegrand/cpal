@@ -265,6 +265,23 @@ pub const SAMPLE_RATE_48K: SampleRate = 48_000;
 /// one frame contains two samples (left and right channels).
 pub type FrameCount = u32;
 
+/// How a WASAPI stream shares its endpoint with the rest of the system.
+///
+/// See the [WASAPI extensions documentation](crate::platform::wasapi_ext) for what the two
+/// modes mean in practice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ShareMode {
+    /// The Windows audio engine mixes this stream with other applications'. The default, and the
+    /// only mode any other backend has.
+    #[default]
+    Shared,
+    /// The stream owns the endpoint outright, bypassing the engine's mixer and format
+    /// conversion. Only one exclusive-mode stream can exist per endpoint, and the user must have
+    /// left "Allow applications to take exclusive control of this device" enabled — turning it
+    /// off is reported as [`crate::ErrorKind::ExclusiveModeDenied`].
+    Exclusive,
+}
+
 /// A stable identifier for an audio device across all supported platforms.
 ///
 /// Device IDs should remain stable across application restarts and can be serialized using `Display`/`FromStr`.
