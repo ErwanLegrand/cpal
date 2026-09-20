@@ -265,14 +265,30 @@ pub const SAMPLE_RATE_48K: SampleRate = 48_000;
 /// one frame contains two samples (left and right channels).
 pub type FrameCount = u32;
 
-/// How a WASAPI stream shares its endpoint with the rest of the system.
+/// How a stream shares its endpoint with the rest of the system.
 ///
-/// See the [WASAPI extensions documentation](crate::platform::wasapi_ext) for what the two
-/// modes mean in practice.
+/// Everything CPAL does by default uses [`AccessMode::Shared`]: the audio engine mixes the
+/// stream with every other application's, and may resample or convert it on the way.
+/// [`AccessMode::Exclusive`] hands the endpoint to a single client — no mixing, no format
+/// conversion, and typically a much smaller device period — at the cost of the device becoming
+/// unavailable to everything else while the stream lives.
+///
+/// The mode is a device-level guarantee rather than a stream option, because it changes what is
+/// enumerable: exclusive mode exposes the hardware-native formats, where shared mode exposes
+/// what the engine can mix. Bind it to a device once through
+/// [`Device::with_access_mode`](crate::Device::with_access_mode), and the resulting
+/// [`ConfiguredDevice`] answers every ordinary query and builder for that mode.
+///
+/// Only the WASAPI backend honours [`AccessMode::Exclusive`] today. Elsewhere — and on a device
+/// with no WASAPI endpoint behind it — binding still succeeds, and the operation that needs the
+/// mode is refused with [`ErrorKind::UnsupportedOperation`] rather than the stream being
+/// silently downgraded to shared: nothing here is ever served a mode it did not ask for.
+///
+/// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ShareMode {
-    /// The Windows audio engine mixes this stream with other applications'. The default, and the
-    /// only mode any other backend has.
+pub enum AccessMode {
+    /// The audio engine mixes this stream with other applications'. The default, and the only
+    /// mode any other backend has today.
     #[default]
     Shared,
     /// The stream owns the endpoint outright, bypassing the engine's mixer and format
@@ -281,6 +297,73 @@ pub enum ShareMode {
     /// off is reported as [`crate::ErrorKind::ExclusiveModeDenied`].
     Exclusive,
 }
+
+/// A device with an [`AccessMode`] bound to it, from
+/// [`Device::with_access_mode`](crate::Device::with_access_mode).
+///
+/// It implements [`DeviceTrait`](crate::traits::DeviceTrait), so the configuration queries and
+/// stream builders are the cross-platform ones, answering for the mode it carries. With
+/// [`AccessMode::Shared`] it behaves exactly as the device it borrows, on every platform.
+///
+/// The supported-format set, the default format and the buffer size a device reports all differ
+/// between the two modes, so negotiate and build on the same value that carries the mode:
+///
+/// ```no_run
+/// use cpal::{AccessMode, Data};
+/// use cpal::traits::{DeviceTrait, HostTrait};
+///
+/// let device = cpal::default_host().default_output_device().unwrap();
+/// let exclusive = device.with_access_mode(AccessMode::Exclusive);
+///
+/// let config = exclusive.default_output_config()?;
+/// let stream = exclusive.build_output_stream_raw(
+///     config.config(),
+///     config.sample_format(),
+///     move |data, _| data.bytes_mut().fill(0),
+///     |err| eprintln!("{err}"),
+///     None,
+/// )?;
+/// # Ok::<(), cpal::Error>(())
+/// ```
+///
+/// A [`SupportedStreamConfig`] negotiated here records nothing about the mode it came from;
+/// tracking it in the config is part of the upstream redesign
+/// ([RustAudio/cpal#1334](https://github.com/RustAudio/cpal/issues/1334)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConfiguredDevice<'a> {
+    pub(crate) device: &'a Device,
+    pub(crate) access_mode: AccessMode,
+}
+
+impl<'a> ConfiguredDevice<'a> {
+    /// Binds `device` and `access_mode` together; the only construction path, from
+    /// [`Device::with_access_mode`](crate::Device::with_access_mode).
+    pub(crate) fn new(device: &'a Device, access_mode: AccessMode) -> Self {
+        Self {
+            device,
+            access_mode,
+        }
+    }
+
+    /// Whether this device is configured with the mode every device honours, in which case every
+    /// method forwards to the bare device unchanged.
+    pub(crate) fn is_default(&self) -> bool {
+        self.access_mode == AccessMode::Shared
+    }
+}
+
+/// The device's own name, unchanged: this is the same endpoint, and
+/// [`DeviceTrait`](crate::traits::DeviceTrait) documents `to_string()` as the way to get a
+/// device's name.
+impl<'a> std::fmt::Display for ConfiguredDevice<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.device, f)
+    }
+}
+
+// `Send` and `Sync` are the automatic ones: the only fields are a `&Device`, which is both as
+// long as `Device: Sync`, and plain data. Every `Device` here is a `DeviceTrait`, which requires
+// `Send + Sync`.
 
 /// A stable identifier for an audio device across all supported platforms.
 ///

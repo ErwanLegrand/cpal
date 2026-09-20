@@ -173,7 +173,7 @@ If you receive errors about no default input or output device:
 
 Exclusive mode hands the endpoint to a single application, so opening it fails when another application already holds it (`DeviceBusy`), or when **Allow applications to take exclusive control of this device** is unchecked in the device's properties under Windows Sound settings (`ExclusiveModeDenied`). Neither can be resolved from code: close the other application, or re-enable the checkbox, and try again.
 
-Exclusive mode also reports a different set of supported formats than shared mode, so negotiate the config on the device returned by `with_options(ShareMode::Exclusive)` and build the stream from that same value. A config negotiated in exclusive mode and passed to the bare device silently opens shared mode instead. See the [exclusive example](examples/exclusive.rs).
+Exclusive mode also reports a different set of supported formats than shared mode, so negotiate the config on the device returned by `with_access_mode(AccessMode::Exclusive)` and build the stream from that same value. A config negotiated in exclusive mode and passed to the bare device silently opens shared mode instead. See the [exclusive example](examples/exclusive.rs).
 
 ## ALSA, PipeWire, and PulseAudio
 

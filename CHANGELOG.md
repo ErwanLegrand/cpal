@@ -18,12 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebAudio**: Input and duplex streams are now supported.
 - **WebAudio**: Added support for Emscripten targets via [wasm-bindgen/Emscripten integration](https://github.com/wasm-bindgen/wasm-bindgen/issues/5237).
 - `ErrorKind::ExclusiveModeDenied` reports the system refusing exclusive use of an otherwise usable device.
-- **WASAPI**: Exclusive-mode streams and configuration queries. `WasapiDeviceExt::with_options`
-  binds a share mode to a device, and the result is a `DeviceTrait` whose queries and builders
-  answer for that mode. Callers that do not ask for a share mode are unaffected.
-- **WASAPI**: `cpal::platform::wasapi_ext`, including `WasapiDeviceExt::with_options`, is compiled
-  on every platform, so requesting a WASAPI share mode needs no `cfg` attribute; exclusive mode is
-  refused rather than silently downgraded on platforms without it.
+- **WASAPI**: Exclusive-mode streams and configuration queries. `Device::with_access_mode`
+  binds an `AccessMode` to a device, and the resulting `ConfiguredDevice` is a `DeviceTrait`
+  whose queries and builders answer for that mode. Callers that do not ask for an access mode
+  are unaffected.
+- **WASAPI**: `AccessMode` and `Device::with_access_mode` are part of the cross-platform API,
+  so requesting exclusive mode needs no `cfg` attribute; exclusive mode is refused rather than
+  silently downgraded on platforms without it.
 - Added the `exclusive` example, demonstrating WASAPI exclusive-mode streams.
 
 ### Changed
@@ -70,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: Output streams now start with real audio immediately instead of undefined content in the render buffer.
 - **WASAPI**: A stream paused immediately after starting no longer plays silence before real audio on resume.
 - **WASAPI**: Fix `I64` and `F64` incorrectly reported as supported output formats.
-- **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback.
+- **WASAPI**: An empty capture packet is now skipped rather than delivered to the data callback as a null buffer.
 - **WASAPI**: Capture no longer panics on a packet larger than the endpoint buffer holding it, and
   hands the packet back to WASAPI on the capture error paths that used to leak it.
 - **WASAPI**: A device or audio-service failure while querying format support is now reported
@@ -78,7 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WASAPI**: The shift that left-justifies a sample in a wider container is read off the
   negotiated format's `wBitsPerSample` and `wValidBitsPerSample` rather than tested for on
   `SampleFormat::I24`. Unchanged numerically for every format the backend encodes.
-- **WASAPI**: Empty capture packets are no longer handed to the data callback as a null buffer.
 - **WASAPI**: A driver reporting `WAVE_FORMAT_EXTENSIBLE` without the matching extension bytes no longer causes an out-of-bounds read; the format is reported as unsupported instead.
 - **WASAPI**: A configuration whose derived `WAVEFORMATEX` fields overflow is now rejected as `UnsupportedConfig` instead of panicking in debug builds and wrapping in release.
 - **WASAPI**: An implausible buffer size reported by the audio client is now rejected when the stream is built, instead of becoming a huge allocation on the audio thread.

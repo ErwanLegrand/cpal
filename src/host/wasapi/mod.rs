@@ -15,10 +15,9 @@ pub use self::device::{
     reason = "re-exported for public API via platform module"
 )]
 pub use self::stream::Stream;
-pub(crate) use crate::ShareMode;
+pub(crate) use crate::AccessMode;
 use crate::{Error, ErrorKind, traits::HostTrait};
 
-pub(crate) mod container_align;
 mod device;
 mod stream;
 

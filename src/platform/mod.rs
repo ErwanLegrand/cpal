@@ -35,9 +35,10 @@ pub use crate::host::pipewire::Host as PipeWireHost;
 #[cfg(feature = "custom")]
 pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
 
-// Unconditional on purpose; see the module's own documentation. Its items are not re-exported
-// here: one public path each, in the module whose documentation explains them.
-pub mod wasapi_ext;
+// The access-mode seam: how the platform `Device` dispatch answers the mode-aware operations.
+// Crate-internal, and not WASAPI-specific: the public access-mode surface lives at the crate
+// root, and each backend is reached through its own `DeviceTrait` implementation.
+mod access_mode;
 
 /// A macro to assist with implementing a platform's dynamically dispatched [`Host`] type.
 ///
@@ -979,16 +980,16 @@ mod platform_impl {
     );
 
     impl SupportedInputConfigs {
-        /// Wraps the WASAPI backend's own iterator, so [`super::WasapiDeviceExt`] can answer
-        /// with this opaque type.
+        /// Wraps the WASAPI backend's own iterator, so the platform `Device`'s mode-aware
+        /// queries can answer with this opaque type.
         pub(crate) fn from_wasapi(configs: crate::host::wasapi::SupportedInputConfigs) -> Self {
             Self(SupportedInputConfigsInner::Wasapi(configs))
         }
     }
 
     impl SupportedOutputConfigs {
-        /// Wraps the WASAPI backend's own iterator, so [`super::WasapiDeviceExt`] can answer
-        /// with this opaque type.
+        /// Wraps the WASAPI backend's own iterator, so the platform `Device`'s mode-aware
+        /// queries can answer with this opaque type.
         pub(crate) fn from_wasapi(configs: crate::host::wasapi::SupportedOutputConfigs) -> Self {
             Self(SupportedOutputConfigsInner::Wasapi(configs))
         }

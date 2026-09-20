@@ -6,6 +6,10 @@
 //! at the *bottom* of an `i32`. WASAPI negotiates such formats, so this backend shifts samples up
 //! on the way out and down on the way in.
 //!
+//! The convention is the container format's rather than any one API's, and the arithmetic is
+//! plain integer work with no platform types in it, so this module — and its tests — is built on
+//! every platform rather than only on Windows.
+//!
 //! [`SampleFormat::I24`]: crate::SampleFormat::I24
 
 // The container width these functions walk, in bytes.

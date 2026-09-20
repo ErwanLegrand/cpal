@@ -18,7 +18,7 @@ use crate::{
     InterfaceType, SampleFormat, SampleRate, StreamConfig, SupportedBufferSize,
     SupportedStreamConfig, SupportedStreamConfigRange,
     error::ResultExt,
-    host::{ErrorCallbackArc, com::ComString},
+    host::{ErrorCallbackArc, com::ComString, container_align},
 };
 
 use windows::{
@@ -38,7 +38,7 @@ use windows::{
 };
 
 use super::{
-    ShareMode, container_align,
+    AccessMode,
     stream::{AudioClientFlow, DefaultDeviceMonitor, PlaybackState, Stream, StreamInner},
 };
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
@@ -58,7 +58,9 @@ const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
     pid: 8,
 };
 
-const DEFAULT_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+// The run loop waits on the client's event handle in every configuration, so this is not a
+// default to be overridden per mode: event-driven buffering is what the stream is built on.
+const STREAM_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
 /// The least time the exclusive-mode alignment retry gives its own activation, whatever is left
 /// of the caller's activation timeout by then. Only a floor: a caller whose whole budget is
@@ -84,10 +86,26 @@ impl ActivationBudget {
         }
     }
 
-    /// What is left for an activation starting now. A remainder at or near zero would fail a
-    /// device that is merely slow to activate, so it is floored — never above the budget the
-    /// caller gave in the first place.
-    fn remaining(&self) -> Option<Duration> {
+    /// The timeout for an activation that may be followed by the alignment retry.
+    ///
+    /// The floor the retry will need is reserved out of the budget here, so a build that does
+    /// retry still finishes inside the caller's timeout instead of overrunning it by the floor.
+    /// Only exclusive-mode builds can retry, so only they pay the reservation.
+    fn activation(&self, may_retry: bool) -> Option<Duration> {
+        self.timeout.map(|budget| {
+            let left = budget.saturating_sub(self.started.elapsed());
+            if may_retry && left > RETRY_ACTIVATION_FLOOR {
+                left - RETRY_ACTIVATION_FLOOR
+            } else {
+                left
+            }
+        })
+    }
+
+    /// The timeout for the alignment retry: what is left of the budget, floored so a first
+    /// activation that consumed all of it does not hand the retry a zero timeout, which no
+    /// activation can succeed with. Never above the budget the caller gave in the first place.
+    fn retry(&self) -> Option<Duration> {
         self.timeout.map(|budget| {
             budget
                 .saturating_sub(self.started.elapsed())
@@ -110,9 +128,19 @@ enum DeviceHandle {
     Specific(Audio::IMMDevice),
 }
 
-// The `(sample_rate, sample_format)` pairs one share mode's probe accepted, if that mode has
-// been probed yet.
-type ProbedFormats = Option<(ShareMode, Vec<(SampleRate, SampleFormat)>)>;
+// The `(sample_rate, sample_format)` pairs each access mode's probe accepted, if that mode has
+// been probed yet. One slot per mode: alternating shared and exclusive queries are the natural
+// "can this endpoint do exclusive?" pattern, and a single slot would make them evict each other
+// and re-pay the whole probe every time.
+type ProbedFormats = [Option<Vec<(SampleRate, SampleFormat)>>; 2];
+
+/// The `probed_formats` slot for `access_mode`.
+fn probe_slot(access_mode: AccessMode) -> usize {
+    match access_mode {
+        AccessMode::Shared => 0,
+        AccessMode::Exclusive => 1,
+    }
+}
 
 /// An opaque type that identifies an end point.
 #[derive(Clone)]
@@ -121,7 +149,7 @@ pub struct Device {
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
-    // The `(sample_rate, sample_format)` pairs the endpoint last accepted, cached per share
+    // The `(sample_rate, sample_format)` pairs the endpoint last accepted, cached per access
     // mode: probing costs up to ~90 blocking driver round-trips, so `supported_formats` stores
     // the result and reuses it on later calls instead of re-probing. Only successes are stored.
     //
@@ -152,19 +180,19 @@ impl DeviceTrait for Device {
     }
 
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
-        Self::supported_input_configs(self)
+        self.supported_input_configs_for(AccessMode::Shared)
     }
 
     fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
-        Self::supported_output_configs(self)
+        self.supported_output_configs_for(AccessMode::Shared)
     }
 
     fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Self::default_input_config(self)
+        self.default_input_config_for(AccessMode::Shared)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        Self::default_output_config(self)
+        self.default_output_config_for(AccessMode::Shared)
     }
 
     fn build_input_stream_raw<D, E>(
@@ -182,7 +210,7 @@ impl DeviceTrait for Device {
         self.build_input_stream_raw_for(
             config,
             sample_format,
-            ShareMode::Shared,
+            AccessMode::Shared,
             data_callback,
             error_callback,
             timeout,
@@ -204,7 +232,7 @@ impl DeviceTrait for Device {
         self.build_output_stream_raw_for(
             config,
             sample_format,
-            ShareMode::Shared,
+            AccessMode::Shared,
             data_callback,
             error_callback,
             timeout,
@@ -238,14 +266,14 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
 }
 
 // Given the audio client and format, returns whether the device supports it natively in
-// `share_mode`, without format conversion.
+// `access_mode`, without format conversion.
 pub unsafe fn is_format_supported(
     client: &Audio::IAudioClient,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
 ) -> Result<bool, Error> {
-    let hr = match share_mode {
-        ShareMode::Shared => {
+    let hr = match access_mode {
+        AccessMode::Shared => {
             let mut closest_match: *mut Audio::WAVEFORMATEX = ptr::null_mut();
             let hr = unsafe {
                 client.IsFormatSupported(
@@ -261,7 +289,7 @@ pub unsafe fn is_format_supported(
         }
         // Exclusive mode has no closest match to report: the endpoint either accepts the format
         // or it does not, and the out-parameter is documented as taking NULL here.
-        ShareMode::Exclusive => unsafe {
+        AccessMode::Exclusive => unsafe {
             client.IsFormatSupported(Audio::AUDCLNT_SHAREMODE_EXCLUSIVE, waveformatex_ptr, None)
         },
     };
@@ -279,18 +307,20 @@ fn format_support_from_hresult(hr: HRESULT) -> Result<bool, Error> {
         // AUDCLNT_E_UNSUPPORTED_FORMAT instead.
         Foundation::S_FALSE | Audio::AUDCLNT_E_UNSUPPORTED_FORMAT => Ok(false),
         // Not an answer about the format at all: the endpoint went away, the session's resources
-        // were reclaimed, the audio service is not running, or the user has turned exclusive-mode
-        // use of this endpoint off. Reporting these as "unsupported" would empty out
-        // `supported_*_configs_with(Exclusive)`, which probes formats one by one with no other
-        // check in front of it, and turn an unplugged, busy, or exclusive-denied device into
-        // `UnsupportedConfig`. Propagated, they map to DeviceNotAvailable / StreamInvalidated /
-        // HostUnavailable / ExclusiveModeDenied / DeviceBusy in
-        // `impl From<windows::core::Error> for Error`.
+        // were reclaimed, the audio service is not running, the user has turned exclusive-mode
+        // use of this endpoint off, or the process is out of memory. Reporting these as
+        // "unsupported" would empty out `supported_*_configs_with(Exclusive)`, which probes
+        // formats one by one with no other check in front of it, and turn an unplugged, busy, or
+        // exclusive-denied device into `UnsupportedConfig`. Propagated, they map to
+        // DeviceNotAvailable / StreamInvalidated / HostUnavailable / ExclusiveModeDenied /
+        // DeviceBusy / BackendError in `impl From<windows::core::Error> for Error`.
         Audio::AUDCLNT_E_DEVICE_INVALIDATED
         | Audio::AUDCLNT_E_RESOURCES_INVALIDATED
         | Audio::AUDCLNT_E_SERVICE_NOT_RUNNING
         | Audio::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
-        | Audio::AUDCLNT_E_DEVICE_IN_USE => {
+        | Audio::AUDCLNT_E_DEVICE_IN_USE
+        | Audio::AUDCLNT_E_ENDPOINT_CREATE_FAILED
+        | Foundation::E_OUTOFMEMORY => {
             Err(windows::core::Error::from_hresult(hr)).context("Failed to query format support")
         }
         // Anything else — a driver rejecting the struct with E_INVALIDARG, say — is about this
@@ -366,19 +396,39 @@ unsafe fn format_from_waveformatex_ptr(
 
     let sample_rate = unsafe { (*waveformatex_ptr).nSamplesPerSec };
 
-    // GetBufferSizeLimits is only used for Hardware-Offloaded Audio
-    // Processing, which was added in Windows 8, which places hardware
-    // limits on the size of the audio buffer. If the sound system
-    // *isn't* using offloaded audio, we're using a software audio
-    // processing stack and have pretty much free rein to set buffer
-    // size.
-    //
-    // In software audio stacks GetBufferSizeLimits returns
-    // AUDCLNT_E_OFFLOAD_MODE_ONLY.
-    //
-    // https://docs.microsoft.com/en-us/windows-hardware/drivers/audio/hardware-offloaded-audio-processing
+    // SAFETY: the caller passes the pointer `client` answered for, valid for the call.
+    let buffer_size = unsafe { hardware_buffer_size(audio_client, waveformatex_ptr, sample_rate) };
+
+    let format = SupportedStreamConfig {
+        channels: unsafe { (*waveformatex_ptr).nChannels } as _,
+        sample_rate,
+        buffer_size,
+        sample_format,
+    };
+    Some(format)
+}
+
+// The buffer size the endpoint reports for `format`, from its hardware limits when it has any.
+//
+// `GetBufferSizeLimits` is only used for Hardware-Offloaded Audio Processing, which was added in
+// Windows 8, which places hardware limits on the size of the audio buffer. If the sound system
+// *isn't* using offloaded audio, we're using a software audio processing stack and have pretty
+// much free rein to set buffer size.
+//
+// In software audio stacks GetBufferSizeLimits returns AUDCLNT_E_OFFLOAD_MODE_ONLY.
+//
+// https://docs.microsoft.com/en-us/windows-hardware/drivers/audio/hardware-offloaded-audio-processing
+//
+// # Safety
+//
+// `waveformatex_ptr` must point at the format `audio_client` was queried with.
+unsafe fn hardware_buffer_size(
+    audio_client: &Audio::IAudioClient,
+    waveformatex_ptr: *const Audio::WAVEFORMATEX,
+    sample_rate: SampleRate,
+) -> SupportedBufferSize {
     let (mut min_buffer_duration, mut max_buffer_duration) = (0, 0);
-    let buffer_size_is_limited = audio_client
+    let limited = audio_client
         .cast::<Audio::IAudioClient2>()
         .and_then(|audio_client| unsafe {
             audio_client.GetBufferSizeLimits(
@@ -389,7 +439,7 @@ unsafe fn format_from_waveformatex_ptr(
             )
         })
         .is_ok();
-    let buffer_size = if buffer_size_is_limited {
+    if limited {
         SupportedBufferSize::Range {
             min: buffer_duration_to_frames(min_buffer_duration, sample_rate),
             max: buffer_duration_to_frames(max_buffer_duration, sample_rate),
@@ -397,15 +447,7 @@ unsafe fn format_from_waveformatex_ptr(
     } else {
         // Software audio stack: no hardware buffer constraint to report.
         SupportedBufferSize::Unknown
-    };
-
-    let format = SupportedStreamConfig {
-        channels: unsafe { (*waveformatex_ptr).nChannels } as _,
-        sample_rate,
-        buffer_size,
-        sample_format,
-    };
-    Some(format)
+    }
 }
 
 unsafe impl Send for Device {}
@@ -634,7 +676,7 @@ impl Device {
         Device {
             device: DeviceHandle::Specific(device),
             future_audio_client: Arc::new(Mutex::new(None)),
-            probed_formats: Arc::new(Mutex::new(None)),
+            probed_formats: Arc::new(Mutex::new([None, None])),
         }
     }
 
@@ -642,7 +684,7 @@ impl Device {
         Device {
             device: DeviceHandle::DefaultOutput,
             future_audio_client: Arc::new(Mutex::new(None)),
-            probed_formats: Arc::new(Mutex::new(None)),
+            probed_formats: Arc::new(Mutex::new([None, None])),
         }
     }
 
@@ -650,7 +692,7 @@ impl Device {
         Device {
             device: DeviceHandle::DefaultInput,
             future_audio_client: Arc::new(Mutex::new(None)),
-            probed_formats: Arc::new(Mutex::new(None)),
+            probed_formats: Arc::new(Mutex::new([None, None])),
         }
     }
 
@@ -738,7 +780,7 @@ impl Device {
     // number of channels seems to be supported. Any, more or less returns an invalid
     // parameter error. Thus, we just assume that the default number of channels is the only
     // number supported.
-    fn supported_formats(&self, share_mode: ShareMode) -> Result<SupportedInputConfigs, Error> {
+    fn supported_formats(&self, access_mode: AccessMode) -> Result<SupportedInputConfigs, Error> {
         // initializing COM because we call `CoTaskMemFree` to release the format.
         com::com_initialized();
 
@@ -760,8 +802,8 @@ impl Device {
             //
             // Shared mode only: `GetMixFormat` describes the engine, and an endpoint routinely
             // refuses that format in exclusive mode while supporting exclusive mode perfectly well.
-            if share_mode == ShareMode::Shared
-                && !is_format_supported(client, share_mode, default_waveformatex_ptr.0)?
+            if access_mode == AccessMode::Shared
+                && !is_format_supported(client, access_mode, default_waveformatex_ptr.0)?
             {
                 return Err(Error::with_message(
                     ErrorKind::UnsupportedConfig,
@@ -784,7 +826,7 @@ impl Device {
             // do not, and neither does exclusive mode in either direction: there only native
             // formats will work.
             let assume_convertible =
-                share_mode == ShareMode::Shared && self.data_flow() == Audio::eRender;
+                access_mode == AccessMode::Shared && self.data_flow() == Audio::eRender;
 
             // For convertible output, restrict to rates the MF Resampler can handle. Exclusive
             // mode pays a blocking driver round-trip per probe, so it stops at the rates PCM
@@ -795,7 +837,7 @@ impl Device {
                 .filter(|&r| {
                     if assume_convertible {
                         (OUTPUT_MIN_SAMPLE_RATE..=OUTPUT_MAX_SAMPLE_RATE).contains(&r)
-                    } else if share_mode == ShareMode::Exclusive {
+                    } else if access_mode == AccessMode::Exclusive {
                         (OUTPUT_MIN_SAMPLE_RATE..=EXCLUSIVE_MAX_SAMPLE_RATE).contains(&r)
                     } else {
                         true
@@ -809,31 +851,24 @@ impl Device {
 
             // The endpoint's accepted `(sample_rate, sample_format)` pairs, from the cache or a
             // fresh probe. Probing costs up to ~90 blocking driver round-trips (18 rates by 5
-            // formats), so the result is stored per share mode; only successes are cached, and
+            // formats), so the result is stored per access mode; only successes are cached, and
             // an error here re-probes next time.
             let accepted_formats = {
                 let mut cache_lock = self.probed_formats.lock().map_err(|_| {
                     Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
                 })?;
-                match cache_lock.as_ref() {
-                    Some((cached_share_mode, cached_formats))
-                        if *cached_share_mode == share_mode =>
-                    {
-                        cached_formats.clone()
-                    }
-                    _ => {
+                match cache_lock[probe_slot(access_mode)].as_ref() {
+                    Some(cached_formats) => cached_formats.clone(),
+                    None => {
                         let probed = probe_accepted_formats(
                             client,
-                            share_mode,
+                            access_mode,
                             format.channels,
                             sample_rates,
-                            match share_mode {
-                                ShareMode::Shared => &WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS,
-                                ShareMode::Exclusive => &EXCLUSIVE_SAMPLE_FORMATS,
-                            },
+                            &WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS,
                             assume_convertible,
                         )?;
-                        *cache_lock = Some((share_mode, probed.clone()));
+                        cache_lock[probe_slot(access_mode)] = Some(probed.clone());
                         probed
                     }
                 }
@@ -846,7 +881,7 @@ impl Device {
                 let buffer_size = match format.buffer_size {
                     // Software stacks: substitute what the device period allows at this rate.
                     SupportedBufferSize::Unknown => device_periods_hns
-                        .map(|periods| period_buffer_size(periods, share_mode, sample_rate))
+                        .map(|periods| period_buffer_size(periods, access_mode, sample_rate))
                         .unwrap_or(SupportedBufferSize::Unknown),
                     // Hardware stacks: report the hardware buffer size limits as-is.
                     other => other,
@@ -864,32 +899,24 @@ impl Device {
         }
     }
 
-    pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
-        self.supported_input_configs_for(ShareMode::Shared)
-    }
-
     pub(crate) fn supported_input_configs_for(
         &self,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<SupportedInputConfigs, Error> {
         if self.data_flow() == Audio::eCapture {
-            self.supported_formats(share_mode)
+            self.supported_formats(access_mode)
         // If it's an output device, assume no input formats.
         } else {
             Ok(vec![].into_iter())
         }
     }
 
-    pub fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
-        self.supported_output_configs_for(ShareMode::Shared)
-    }
-
     pub(crate) fn supported_output_configs_for(
         &self,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<SupportedOutputConfigs, Error> {
         if self.data_flow() == Audio::eRender {
-            self.supported_formats(share_mode)
+            self.supported_formats(access_mode)
         // If it's an input device, assume no output formats.
         } else {
             Ok(vec![].into_iter())
@@ -902,7 +929,7 @@ impl Device {
     // In exclusive mode there is no mixer and no such guarantee: the channel count and sample
     // rate are taken from the mix format, but the sample format is probed for, most preferred
     // first.
-    fn default_format(&self, share_mode: ShareMode) -> Result<SupportedStreamConfig, Error> {
+    fn default_format(&self, access_mode: AccessMode) -> Result<SupportedStreamConfig, Error> {
         // initializing COM because we call `CoTaskMemFree`
         com::com_initialized();
 
@@ -918,28 +945,21 @@ impl Device {
                 .map(WaveFormatExPtr)
                 .context("Failed to get mix format")?;
 
-            let mut config = match share_mode {
-                ShareMode::Shared => format_from_waveformatex_ptr(format_ptr.0, client)
+            let mut config = match access_mode {
+                AccessMode::Shared => format_from_waveformatex_ptr(format_ptr.0, client)
                     .ok_or_else(|| {
                         Error::with_message(
                             ErrorKind::UnsupportedConfig,
                             "Device audio format could not be mapped to a supported format",
                         )
                     })?,
-                ShareMode::Exclusive => exclusive_default_format(client, format_ptr.0)?
-                    .ok_or_else(|| {
-                        Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "Device supports no exclusive-mode format at its default channel \
-                             count and sample rate",
-                        )
-                    })?,
+                AccessMode::Exclusive => exclusive_default_format(client, format_ptr.0)?,
             };
 
             if config.buffer_size == SupportedBufferSize::Unknown {
                 if let Some(periods_hns) = device_periods_hns(client) {
                     config.buffer_size =
-                        period_buffer_size(periods_hns, share_mode, config.sample_rate);
+                        period_buffer_size(periods_hns, access_mode, config.sample_rate);
                 }
             }
             Ok(config)
@@ -957,16 +977,12 @@ impl Device {
         }
     }
 
-    pub fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        self.default_input_config_for(ShareMode::Shared)
-    }
-
     pub(crate) fn default_input_config_for(
         &self,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<SupportedStreamConfig, Error> {
         if self.data_flow() == Audio::eCapture {
-            self.default_format(share_mode)
+            self.default_format(access_mode)
         } else {
             Err(Error::with_message(
                 ErrorKind::UnsupportedOperation,
@@ -975,17 +991,13 @@ impl Device {
         }
     }
 
-    pub fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        self.default_output_config_for(ShareMode::Shared)
-    }
-
     pub(crate) fn default_output_config_for(
         &self,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<SupportedStreamConfig, Error> {
         let data_flow = self.data_flow();
         if data_flow == Audio::eRender {
-            self.default_format(share_mode)
+            self.default_format(access_mode)
         } else {
             Err(Error::with_message(
                 ErrorKind::UnsupportedOperation,
@@ -994,12 +1006,12 @@ impl Device {
         }
     }
 
-    /// `DeviceTrait::build_input_stream_raw` with an explicit share mode.
+    /// `DeviceTrait::build_input_stream_raw` with an explicit access mode.
     pub(crate) fn build_input_stream_raw_for<D, E>(
         &self,
         config: StreamConfig,
         sample_format: SampleFormat,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
@@ -1009,7 +1021,7 @@ impl Device {
         E: FnMut(Error) + Send + 'static,
     {
         let stream_inner =
-            self.build_input_stream_raw_inner(config, sample_format, timeout, share_mode)?;
+            self.build_input_stream_raw_inner(config, sample_format, timeout, access_mode)?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let monitor = self.default_device_monitor()?;
         let stream = Stream::new_input(stream_inner, data_callback, error_callback, monitor)?;
@@ -1017,12 +1029,12 @@ impl Device {
         Ok(stream)
     }
 
-    /// `DeviceTrait::build_output_stream_raw` with an explicit share mode.
+    /// `DeviceTrait::build_output_stream_raw` with an explicit access mode.
     pub(crate) fn build_output_stream_raw_for<D, E>(
         &self,
         config: StreamConfig,
         sample_format: SampleFormat,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
@@ -1035,7 +1047,7 @@ impl Device {
         // `playback` backward.
         let data_callback = crate::host::monotonic_output_callback(data_callback);
         let stream_inner =
-            self.build_output_stream_raw_inner(config, sample_format, timeout, share_mode)?;
+            self.build_output_stream_raw_inner(config, sample_format, timeout, access_mode)?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let monitor = self.default_device_monitor()?;
         let stream = Stream::new_output(stream_inner, data_callback, error_callback, monitor)?;
@@ -1048,7 +1060,7 @@ impl Device {
         config: StreamConfig,
         sample_format: SampleFormat,
         activation_timeout: Option<Duration>,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<StreamInner, Error> {
         crate::validate_stream_config(&config)?;
         unsafe {
@@ -1060,38 +1072,39 @@ impl Device {
             // clock starts here rather than at each activation within it.
             let budget = ActivationBudget::start(activation_timeout);
             let audio_client = self
-                .build_audioclient(budget.remaining())
+                .build_audioclient(budget.activation(access_mode == AccessMode::Exclusive))
                 .context("Failed to build audio client")?;
+
+            // Loopback is a property of the shared-mode engine mixer, which exclusive mode
+            // bypasses. Initialize would fail with AUDCLNT_E_INVALID_STREAM_FLAG; say why instead.
+            // Rejected before the buffer duration is resolved, so a request that cannot succeed
+            // does not query the device's periods first.
+            if access_mode == AccessMode::Exclusive && self.data_flow() == Audio::eRender {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedOperation,
+                    "WASAPI exclusive mode does not support loopback capture from an output device",
+                ));
+            }
 
             // Shared mode: this only affects ring-buffer latency, since the callback period is
             // always GetDevicePeriod(). Exclusive mode: it is also the periodicity, so zero is
             // not a legal value and `BufferSize::Default` resolves to the default period.
             let buffer_duration = buffer_duration_for(
                 &audio_client,
-                share_mode,
+                access_mode,
                 &config.buffer_size,
                 config.sample_rate,
             )?;
 
-            let mut stream_flags = DEFAULT_FLAGS;
+            let mut stream_flags = STREAM_FLAGS;
 
             if self.data_flow() == Audio::eRender {
-                if share_mode == ShareMode::Exclusive {
-                    // Loopback is a property of the shared-mode engine mixer, which exclusive
-                    // mode bypasses. Initialize would fail with AUDCLNT_E_INVALID_STREAM_FLAG;
-                    // say why instead.
-                    return Err(Error::with_message(
-                        ErrorKind::UnsupportedOperation,
-                        "WASAPI exclusive mode does not support loopback capture from an output \
-                         device",
-                    ));
-                }
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
             // Computing the format and initializing the device.
             let (format_attempt, container_shift) =
-                config_to_waveformatextensible(config, sample_format, share_mode).ok_or_else(
+                config_to_waveformatextensible(config, sample_format, access_mode).ok_or_else(
                     || {
                         Error::with_message(
                             ErrorKind::UnsupportedConfig,
@@ -1103,7 +1116,7 @@ impl Device {
             // Finally, initializing the audio client
             let audio_client = self.initialize_audio_client(
                 audio_client,
-                share_mode,
+                access_mode,
                 stream_flags,
                 buffer_duration,
                 &format_attempt,
@@ -1112,13 +1125,12 @@ impl Device {
             let waveformatex = format_attempt.Format;
 
             // obtaining the size of the samples buffer in number of frames
-            let max_frames_in_buffer = audio_client
-                .GetBufferSize()
-                .context("Failed to get buffer size")?;
+            let max_frames_in_buffer =
+                buffer_size_in_frames(&audio_client, &config, waveformatex.nBlockAlign)?;
 
             let period_frames = stream_period_frames(
                 &audio_client,
-                share_mode,
+                access_mode,
                 config.sample_rate,
                 max_frames_in_buffer,
             );
@@ -1163,7 +1175,9 @@ impl Device {
                 bytes_per_frame: waveformatex.nBlockAlign,
                 config,
                 sample_format,
-                share_mode,
+                access_mode,
+                // Capture streams never render, so nothing is waiting to be primed.
+                render_buffer_needs_fill: false,
                 container_shift,
                 stream_latency,
                 skip_callback: Arc::new(AtomicBool::new(false)),
@@ -1177,7 +1191,7 @@ impl Device {
         config: StreamConfig,
         sample_format: SampleFormat,
         activation_timeout: Option<Duration>,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
     ) -> Result<StreamInner, Error> {
         crate::validate_stream_config(&config)?;
         unsafe {
@@ -1189,14 +1203,14 @@ impl Device {
             // clock starts here rather than at each activation within it.
             let budget = ActivationBudget::start(activation_timeout);
             let audio_client = self
-                .build_audioclient(budget.remaining())
+                .build_audioclient(budget.activation(access_mode == AccessMode::Exclusive))
                 .context("Failed to build audio client")?;
 
             // See `build_input_stream_raw_inner` for why exclusive mode resolves
             // `BufferSize::Default` differently.
             let buffer_duration = buffer_duration_for(
                 &audio_client,
-                share_mode,
+                access_mode,
                 &config.buffer_size,
                 config.sample_rate,
             )?;
@@ -1204,18 +1218,18 @@ impl Device {
             // Shared-mode output asks the engine to resample and convert whatever the caller
             // hands over. Exclusive mode has no engine in the path: `Initialize` rejects both
             // flags outright, and the format must already be one the endpoint accepts.
-            let stream_flags = match share_mode {
-                ShareMode::Shared => {
-                    DEFAULT_FLAGS
+            let stream_flags = match access_mode {
+                AccessMode::Shared => {
+                    STREAM_FLAGS
                         | Audio::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
                         | Audio::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                 }
-                ShareMode::Exclusive => DEFAULT_FLAGS,
+                AccessMode::Exclusive => STREAM_FLAGS,
             };
 
             // Computing the format and initializing the device.
             let (format_attempt, container_shift) =
-                config_to_waveformatextensible(config, sample_format, share_mode).ok_or_else(
+                config_to_waveformatextensible(config, sample_format, access_mode).ok_or_else(
                     || {
                         Error::with_message(
                             ErrorKind::UnsupportedConfig,
@@ -1227,7 +1241,7 @@ impl Device {
             // Finally, initializing the audio client
             let audio_client = self.initialize_audio_client(
                 audio_client,
-                share_mode,
+                access_mode,
                 stream_flags,
                 buffer_duration,
                 &format_attempt,
@@ -1245,13 +1259,12 @@ impl Device {
                 .context("Failed to set event handle")?;
 
             // obtaining the size of the samples buffer in number of frames
-            let max_frames_in_buffer = audio_client
-                .GetBufferSize()
-                .context("Failed to get buffer size")?;
+            let max_frames_in_buffer =
+                buffer_size_in_frames(&audio_client, &config, waveformatex.nBlockAlign)?;
 
             let period_frames = stream_period_frames(
                 &audio_client,
-                share_mode,
+                access_mode,
                 config.sample_rate,
                 max_frames_in_buffer,
             );
@@ -1287,7 +1300,9 @@ impl Device {
                 bytes_per_frame: waveformatex.nBlockAlign,
                 config,
                 sample_format,
-                share_mode,
+                access_mode,
+                // The buffer WASAPI hands over is undefined until this stream fills it.
+                render_buffer_needs_fill: true,
                 container_shift,
                 stream_latency,
                 skip_callback: Arc::new(AtomicBool::new(false)),
@@ -1313,7 +1328,7 @@ impl Device {
     unsafe fn initialize_audio_client(
         &self,
         audio_client: Audio::IAudioClient,
-        share_mode: ShareMode,
+        access_mode: AccessMode,
         stream_flags: u32,
         buffer_duration: i64,
         format: &Audio::WAVEFORMATEXTENSIBLE,
@@ -1321,13 +1336,13 @@ impl Device {
     ) -> Result<Audio::IAudioClient, Error> {
         // An event-driven exclusive-mode stream must be given a periodicity, and it must equal
         // the buffer duration. Shared mode requires zero.
-        let periodicity = match share_mode {
-            ShareMode::Shared => 0,
-            ShareMode::Exclusive => buffer_duration,
+        let periodicity = match access_mode {
+            AccessMode::Shared => 0,
+            AccessMode::Exclusive => buffer_duration,
         };
-        let mode = match share_mode {
-            ShareMode::Shared => Audio::AUDCLNT_SHAREMODE_SHARED,
-            ShareMode::Exclusive => Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
+        let mode = match access_mode {
+            AccessMode::Shared => Audio::AUDCLNT_SHAREMODE_SHARED,
+            AccessMode::Exclusive => Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
         };
         let format_ptr = waveformatex_ptr(format);
 
@@ -1348,7 +1363,7 @@ impl Device {
         };
 
         // Only exclusive, event-driven streams can hit this, and only they can recover from it.
-        if share_mode != ShareMode::Exclusive
+        if access_mode != AccessMode::Exclusive
             || err.code() != Audio::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
         {
             return Err(Error::from(err)).context("Failed to initialize audio client");
@@ -1374,7 +1389,7 @@ impl Device {
         // The caller's timeout covers building this stream, not each activation within it, so the
         // retry gets what is left of it rather than a second full budget.
         let audio_client = self
-            .build_audioclient(budget.remaining())
+            .build_audioclient(budget.retry())
             .context("Failed to rebuild audio client for aligned buffer")?;
         unsafe {
             audio_client.Initialize(
@@ -1692,7 +1707,9 @@ const OUTPUT_MAX_SAMPLE_RATE: SampleRate = 384_000;
 const EXCLUSIVE_MAX_SAMPLE_RATE: SampleRate = 768_000;
 
 // The longest buffer `IAudioClient::Initialize` accepts from an event-driven exclusive-mode
-// client; longer is documented to fail with AUDCLNT_E_BUFFER_SIZE_ERROR.
+// client, which its documentation calls pull mode: "The requested duration value for pull mode
+// must not be greater than 5000 milliseconds; for push mode the duration value must not be
+// greater than 2 seconds." Longer is rejected with AUDCLNT_E_BUFFER_SIZE_ERROR.
 const EXCLUSIVE_MAX_BUFFER_HNS: i64 = 5_000 * 10_000;
 
 // The formats cpal probes an endpoint with, `cmp_default_heuristics` best first. U8/I16 map to
@@ -1729,15 +1746,15 @@ const KSAUDIO_SPEAKER_7POINT1_SURROUND: u32 = KSAUDIO_SPEAKER_5POINT1
     | KernelStreaming::SPEAKER_SIDE_LEFT
     | KernelStreaming::SPEAKER_SIDE_RIGHT;
 
-// The `dwChannelMask` to advertise for `share_mode`. Shared mode keeps
+// The `dwChannelMask` to advertise for `access_mode`. Shared mode keeps
 // `KSAUDIO_SPEAKER_DIRECTOUT` (0), which the audio engine accepts; in exclusive mode the format
 // goes to the driver, which may reject a zero mask, so a documented positional layout is used
 // where one exists. Both the `IsFormatSupported` probe and `Initialize` reach the mask here, so
 // the two cannot disagree.
-fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
-    match share_mode {
-        ShareMode::Shared => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
-        ShareMode::Exclusive => match channels {
+fn channel_mask_for(access_mode: AccessMode, channels: u16) -> u32 {
+    match access_mode {
+        AccessMode::Shared => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+        AccessMode::Exclusive => match channels {
             1 => KSAUDIO_SPEAKER_MONO,
             2 => KSAUDIO_SPEAKER_STEREO,
             4 => KSAUDIO_SPEAKER_QUAD,
@@ -1758,7 +1775,7 @@ fn channel_mask_for(share_mode: ShareMode, channels: u16) -> u32 {
 fn config_to_waveformatextensible(
     config: StreamConfig,
     sample_format: SampleFormat,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
 ) -> Option<(Audio::WAVEFORMATEXTENSIBLE, u32)> {
     let (format_tag, sub_format) = match sample_format {
         SampleFormat::U8 | SampleFormat::I16 => (
@@ -1806,7 +1823,7 @@ fn config_to_waveformatextensible(
         cbSize: cb_size,
     };
 
-    let channel_mask = channel_mask_for(share_mode, channels);
+    let channel_mask = channel_mask_for(access_mode, channels);
 
     let waveformatextensible = Audio::WAVEFORMATEXTENSIBLE {
         Format: waveformatex,
@@ -1836,46 +1853,15 @@ fn container_shift(format: &Audio::WAVEFORMATEXTENSIBLE) -> u32 {
     container_align::padding_bits(format.Format.wBitsPerSample, valid_bits)
 }
 
-// Sample formats probed against the endpoint in exclusive mode, where `GetMixFormat` answers for
-// the engine rather than for the device. `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit
-// entries, which no endpoint exposes and which each cost a driver round-trip per sample rate.
-const EXCLUSIVE_SAMPLE_FORMATS: [SampleFormat; 5] = [
-    SampleFormat::U8,
-    SampleFormat::I16,
-    SampleFormat::I24,
-    SampleFormat::I32,
-    SampleFormat::F32,
-];
-
-// `EXCLUSIVE_SAMPLE_FORMATS`, most preferred first.
-//
-// Ordered by `cmp_default_heuristics` rather than by hand, so the format `default_*_config_with`
-// settles on stays the one that ranking `supported_*_configs_with` would pick.
-fn exclusive_sample_formats_by_preference() -> [SampleFormat; EXCLUSIVE_SAMPLE_FORMATS.len()] {
-    fn ranked(sample_format: SampleFormat) -> SupportedStreamConfigRange {
-        SupportedStreamConfigRange {
-            channels: 2,
-            min_sample_rate: 48_000,
-            max_sample_rate: 48_000,
-            buffer_size: SupportedBufferSize::Unknown,
-            sample_format,
-        }
-    }
-
-    let mut formats = EXCLUSIVE_SAMPLE_FORMATS;
-    formats.sort_unstable_by(|a, b| ranked(*b).cmp_default_heuristics(&ranked(*a)));
-    formats
-}
-
 // Builds the `WAVEFORMATEXTENSIBLE` for one candidate and asks the endpoint whether it accepts it
-// under `share_mode`. `None` when the pair does not encode or the endpoint refuses it; a probe
+// under `access_mode`. `None` when the pair does not encode or the endpoint refuses it; a probe
 // error propagates.
 //
 // When `assume_convertible` is set (shared-mode output), the engine converts anything, so the
 // probe is skipped and any pair that encodes as a `WAVEFORMATEXTENSIBLE` counts as accepted.
 fn encode_and_probe(
     client: &Audio::IAudioClient,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     channels: u16,
     sample_rate: SampleRate,
     sample_format: SampleFormat,
@@ -1888,12 +1874,12 @@ fn encode_and_probe(
             buffer_size: BufferSize::Default,
         },
         sample_format,
-        share_mode,
+        access_mode,
     ) else {
         return Ok(None);
     };
     if assume_convertible
-        || unsafe { is_format_supported(client, share_mode, waveformatex_ptr(&waveformat)) }?
+        || unsafe { is_format_supported(client, access_mode, waveformatex_ptr(&waveformat)) }?
     {
         return Ok(Some(waveformat));
     }
@@ -1901,12 +1887,12 @@ fn encode_and_probe(
 }
 
 // Probes every `(sample_rate, sample_format)` pair in `sample_rates` × `sample_formats` against
-// `client`, returning the pairs the endpoint accepts natively in `share_mode`, in the same
+// `client`, returning the pairs the endpoint accepts natively in `access_mode`, in the same
 // rate-major, format-minor order as the inputs. Pairs that fail to encode are skipped; a probe
 // error propagates.
 fn probe_accepted_formats(
     client: &Audio::IAudioClient,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     channels: u16,
     sample_rates: Vec<SampleRate>,
     sample_formats: &[SampleFormat],
@@ -1917,7 +1903,7 @@ fn probe_accepted_formats(
         for sample_format in sample_formats.iter().copied() {
             if encode_and_probe(
                 client,
-                share_mode,
+                access_mode,
                 channels,
                 sample_rate,
                 sample_format,
@@ -1935,7 +1921,8 @@ fn probe_accepted_formats(
 // Finds the format the endpoint accepts in exclusive mode that cpal ranks highest, at the channel
 // count and sample rate of the mix format.
 //
-// Returns `Ok(None)` when the device accepts none of them.
+// `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` is ranked by `cmp_default_heuristics`, so the first
+// format the endpoint accepts is the one `supported_*_configs_with` would pick as the default.
 //
 // # Safety
 //
@@ -1943,17 +1930,15 @@ fn probe_accepted_formats(
 unsafe fn exclusive_default_format(
     client: &Audio::IAudioClient,
     mix_format: *const Audio::WAVEFORMATEX,
-) -> Result<Option<SupportedStreamConfig>, Error> {
+) -> Result<SupportedStreamConfig, Error> {
     // SAFETY: the caller guarantees `mix_format` points at a valid `WAVEFORMATEX`.
     let channels = unsafe { (*mix_format).nChannels };
     let sample_rate = unsafe { (*mix_format).nSamplesPerSec };
 
-    let preferred = exclusive_sample_formats_by_preference();
-
-    for sample_format in preferred {
+    for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
         let Some(waveformat) = encode_and_probe(
             client,
-            ShareMode::Exclusive,
+            AccessMode::Exclusive,
             channels,
             sample_rate,
             sample_format,
@@ -1962,18 +1947,25 @@ unsafe fn exclusive_default_format(
         else {
             continue;
         };
-        // Only a format that maps back to a `SupportedStreamConfig` settles the search: one
-        // the mapper does not recognise must not stop the probe and hide every lower-ranked
-        // format behind it.
-        let format_ptr = waveformatex_ptr(&waveformat);
-        // SAFETY: `format_ptr` points at the `WAVEFORMATEXTENSIBLE` just built, which outlives
-        // both calls, and `client` is the endpoint's own audio client.
-        if let Some(config) = unsafe { format_from_waveformatex_ptr(format_ptr, client) } {
-            return Ok(Some(config));
-        }
+        // The endpoint accepted a format this module encoded, so the sample format is the one it
+        // was encoded from — reading it back off the struct could only re-derive it. The buffer
+        // size does come from the endpoint, which reports hardware limits when it has them.
+        // SAFETY: the pointer is to the `WAVEFORMATEXTENSIBLE` just built, which outlives the
+        // call, and `client` is the endpoint's own audio client.
+        let buffer_size =
+            unsafe { hardware_buffer_size(client, waveformatex_ptr(&waveformat), sample_rate) };
+        return Ok(SupportedStreamConfig {
+            channels,
+            sample_rate,
+            buffer_size,
+            sample_format,
+        });
     }
 
-    Ok(None)
+    Err(Error::with_message(
+        ErrorKind::UnsupportedConfig,
+        "Device supports no exclusive-mode format at its default channel count and sample rate",
+    ))
 }
 
 // The endpoint's default and minimum device periods, in 100-nanosecond units.
@@ -1991,19 +1983,19 @@ fn device_periods_hns(audio_client: &Audio::IAudioClient) -> Option<(i64, i64)> 
 // device's minimum period up to the ceiling `Initialize` documents.
 fn period_buffer_size(
     periods_hns: (i64, i64),
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     sample_rate: SampleRate,
 ) -> SupportedBufferSize {
     let (default_period, minimum_period) = periods_hns;
-    match share_mode {
-        ShareMode::Shared if default_period > 0 => {
+    match access_mode {
+        AccessMode::Shared if default_period > 0 => {
             let frames = buffer_duration_to_frames(default_period, sample_rate);
             SupportedBufferSize::Range {
                 min: frames,
                 max: frames,
             }
         }
-        ShareMode::Exclusive if minimum_period > 0 => SupportedBufferSize::Range {
+        AccessMode::Exclusive if minimum_period > 0 => SupportedBufferSize::Range {
             min: buffer_duration_to_frames(minimum_period, sample_rate),
             max: buffer_duration_to_frames(EXCLUSIVE_MAX_BUFFER_HNS, sample_rate),
         },
@@ -2018,15 +2010,15 @@ fn period_buffer_size(
 // the device's default period; the minimum period is reachable through `BufferSize::Fixed`.
 fn buffer_duration_for(
     audio_client: &Audio::IAudioClient,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     buffer_size: &BufferSize,
     sample_rate: SampleRate,
 ) -> Result<i64, Error> {
-    match (share_mode, buffer_size) {
-        (ShareMode::Shared, _) | (ShareMode::Exclusive, BufferSize::Fixed(_)) => {
+    match (access_mode, buffer_size) {
+        (AccessMode::Shared, _) | (AccessMode::Exclusive, BufferSize::Fixed(_)) => {
             Ok(buffer_size_to_duration(buffer_size, sample_rate))
         }
-        (ShareMode::Exclusive, BufferSize::Default) => device_periods_hns(audio_client)
+        (AccessMode::Exclusive, BufferSize::Default) => device_periods_hns(audio_client)
             .map(|(default_period, _)| default_period)
             .filter(|&period| period > 0)
             .ok_or_else(|| {
@@ -2038,22 +2030,67 @@ fn buffer_duration_for(
     }
 }
 
-// Get the callback size in frames for a stream in `share_mode`.
+// Get the callback size in frames for a stream in `access_mode`.
 fn stream_period_frames(
     audio_client: &Audio::IAudioClient,
-    share_mode: ShareMode,
+    access_mode: AccessMode,
     sample_rate: SampleRate,
     max_frames_in_buffer: FrameCount,
 ) -> FrameCount {
-    match share_mode {
-        ShareMode::Shared => {
+    match access_mode {
+        AccessMode::Shared => {
             shared_mode_period_frames(audio_client, sample_rate, max_frames_in_buffer)
         }
         // An event-driven exclusive-mode stream is handed the whole buffer on every event, so
         // the buffer size *is* the callback size — which is not the same as the period that was
         // requested whenever the endpoint rounded the request up to an aligned one.
-        ShareMode::Exclusive => max_frames_in_buffer,
+        AccessMode::Exclusive => max_frames_in_buffer,
     }
+}
+
+// WASAPI rounds a shared-mode ring up to a whole number of device periods, so a report a little
+// above the request is normal; tens of seconds above it is a driver reporting nonsense.
+const BUFFER_HEADROOM_SECONDS: u32 = 10;
+
+/// Get the size of the ring buffer WASAPI allocated, rejecting implausible values.
+///
+/// Everything downstream derives byte counts from this and the stream sizes its scratch buffer
+/// with it, so an implausible report is rejected here rather than becoming a huge allocation on
+/// the audio thread.
+fn buffer_size_in_frames(
+    audio_client: &Audio::IAudioClient,
+    config: &StreamConfig,
+    bytes_per_frame: u16,
+) -> Result<FrameCount, Error> {
+    let requested = match config.buffer_size {
+        BufferSize::Fixed(frames) => frames,
+        BufferSize::Default => 0,
+    };
+    let max_frames_in_buffer =
+        unsafe { audio_client.GetBufferSize() }.context("Failed to get buffer size")?;
+    let sample_rate = config.sample_rate;
+    let cap = requested.saturating_add(sample_rate.saturating_mul(BUFFER_HEADROOM_SECONDS));
+    if max_frames_in_buffer > cap {
+        return Err(Error::with_message(
+            ErrorKind::BackendError,
+            format!(
+                "Audio client reported a buffer of {max_frames_in_buffer} frames, more than the \
+                 {cap} frames allowed ({requested} requested plus {BUFFER_HEADROOM_SECONDS} s at \
+                 {sample_rate} Hz)"
+            ),
+        ));
+    }
+    // The stream derives byte counts from these two; on 32-bit the product can wrap.
+    if (max_frames_in_buffer as usize)
+        .checked_mul(bytes_per_frame as usize)
+        .is_none()
+    {
+        return Err(Error::with_message(
+            ErrorKind::BackendError,
+            "Audio buffer size overflows the address space",
+        ));
+    }
+    Ok(max_frames_in_buffer)
 }
 
 /// Get the default device period in frames for a shared-mode stream.
@@ -2105,17 +2142,38 @@ mod tests {
     }
 
     #[test]
-    fn an_activation_that_starts_late_gets_only_what_is_left_of_the_budget() {
-        let budget = budget_started(Some(Duration::from_secs(2)), Duration::from_millis(1_500));
-        let remaining = budget.remaining().expect("a timeout");
-        // The real clock keeps running between here and `remaining()`, so the deduction can only
-        // be bounded: what matters is that the 1.5s already spent came off the 2s budget.
+    fn a_build_that_cannot_retry_keeps_the_whole_budget() {
+        // Nothing is reserved when no alignment retry can follow, so the first activation gets
+        // the whole remaining budget.
+        let fresh = budget_started(Some(Duration::from_secs(2)), Duration::ZERO);
+        let first = fresh.activation(false).expect("a timeout");
         assert!(
-            remaining <= Duration::from_millis(500)
-                && remaining > Duration::from_millis(400)
-                && remaining > RETRY_ACTIVATION_FLOOR,
+            first > Duration::from_secs(2) - RETRY_ACTIVATION_FLOOR,
+            "{first:?}"
+        );
+
+        // The deduction still applies: the 1.5s already spent came off the 2s budget.
+        let late = budget_started(Some(Duration::from_secs(2)), Duration::from_millis(1_500));
+        let remaining = late.activation(false).expect("a timeout");
+        assert!(
+            remaining <= Duration::from_millis(500) && remaining > Duration::from_millis(400),
             "{remaining:?}"
         );
+    }
+
+    #[test]
+    fn the_reserved_floor_keeps_a_retrying_build_inside_the_callers_timeout() {
+        let timeout = Duration::from_secs(2);
+
+        // Nothing spent yet: the first activation is given the budget less the retry's floor.
+        let fresh = budget_started(Some(timeout), Duration::ZERO);
+        let first = fresh.activation(true).expect("a timeout");
+        assert!(first <= timeout - RETRY_ACTIVATION_FLOOR, "{first:?}");
+
+        // The first activation consuming that whole slice leaves the retry exactly the floor, so
+        // the two together cannot exceed the caller's timeout.
+        let spent = budget_started(Some(timeout), timeout - RETRY_ACTIVATION_FLOOR);
+        assert_eq!(spent.retry(), Some(RETRY_ACTIVATION_FLOOR));
     }
 
     #[test]
@@ -2123,20 +2181,21 @@ mod tests {
         // What the alignment retry would see after a first activation ate the whole timeout:
         // without the floor it would be handed zero and fail a merely slow device.
         let budget = budget_started(Some(Duration::from_secs(2)), Duration::from_secs(9));
-        assert_eq!(budget.remaining(), Some(RETRY_ACTIVATION_FLOOR));
+        assert_eq!(budget.retry(), Some(RETRY_ACTIVATION_FLOOR));
     }
 
     #[test]
     fn the_floor_never_lifts_a_budget_above_what_the_caller_asked_for() {
         let tiny = RETRY_ACTIVATION_FLOOR / 5;
         let budget = budget_started(Some(tiny), Duration::from_secs(9));
-        assert_eq!(budget.remaining(), Some(tiny));
+        assert_eq!(budget.retry(), Some(tiny));
     }
 
     #[test]
     fn no_timeout_stays_no_timeout_however_long_the_build_takes() {
         let budget = budget_started(None, Duration::from_secs(9));
-        assert_eq!(budget.remaining(), None);
+        assert_eq!(budget.activation(true), None);
+        assert_eq!(budget.retry(), None);
     }
 
     fn container_shift_for(sample_format: SampleFormat) -> u32 {
@@ -2145,7 +2204,7 @@ mod tests {
             sample_rate: 48_000,
             buffer_size: BufferSize::Default,
         };
-        config_to_waveformatextensible(config, sample_format, ShareMode::Shared)
+        config_to_waveformatextensible(config, sample_format, AccessMode::Shared)
             .expect("a format the backend encodes")
             .1
     }
@@ -2180,7 +2239,7 @@ mod tests {
     fn shared_mode_always_asks_for_directout() {
         for channels in CHANNEL_COUNTS {
             assert_eq!(
-                channel_mask_for(ShareMode::Shared, channels),
+                channel_mask_for(AccessMode::Shared, channels),
                 0,
                 "{channels}"
             );
@@ -2197,7 +2256,7 @@ mod tests {
             (8, 0x63F), // KSAUDIO_SPEAKER_7POINT1_SURROUND
         ] {
             assert_eq!(
-                channel_mask_for(ShareMode::Exclusive, channels),
+                channel_mask_for(AccessMode::Exclusive, channels),
                 mask,
                 "{channels}"
             );
@@ -2208,7 +2267,7 @@ mod tests {
     fn exclusive_mode_falls_back_to_directout_for_undocumented_widths() {
         for channels in [0, 3, 5, 7, 9, 18, 19, 31, 32, 33, u16::MAX] {
             assert_eq!(
-                channel_mask_for(ShareMode::Exclusive, channels),
+                channel_mask_for(AccessMode::Exclusive, channels),
                 0,
                 "{channels}"
             );
@@ -2218,7 +2277,7 @@ mod tests {
     #[test]
     fn exclusive_mode_masks_are_positional_and_never_reserved() {
         for channels in CHANNEL_COUNTS {
-            let mask = channel_mask_for(ShareMode::Exclusive, channels);
+            let mask = channel_mask_for(AccessMode::Exclusive, channels);
             assert_eq!(mask & !DEFINED_SPEAKER_POSITIONS, 0, "{channels}");
             // A non-zero mask must name exactly as many positions as there are channels, since
             // the channels are interleaved in the order the set bits appear.
@@ -2289,8 +2348,11 @@ mod tests {
         }
     }
 
-    // Ranked here rather than compared against a second hardcoded list, so that a probe order
-    // disagreeing with `cmp_default_heuristics` cannot pass by being wrong in both places.
+    // The guard for `exclusive_default_format` using `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS`
+    // directly: that list is what decides which format exclusive mode settles on, so it has to
+    // stay in the order `cmp_default_heuristics` ranks. Ranked here rather than compared against
+    // a second hardcoded list, so that a probe order disagreeing with `cmp_default_heuristics`
+    // cannot pass by being wrong in both places.
     #[test]
     fn the_exclusive_probe_order_agrees_with_cmp_default_heuristics() {
         for pair in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS.windows(2) {
@@ -2303,36 +2365,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_exclusive_probe_set_is_every_format_narrower_than_64_bits() {
-        // `WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS` minus its 64-bit entries, spelled out here on
-        // purpose: no endpoint exposes 64-bit formats, and every entry costs a blocking driver
-        // round-trip per sample rate, so adding a narrow `SampleFormat` to the probe set is a
-        // decision — this test fails until one is made for it. (The unsigned formats stay out
-        // because they are not encodable as `WAVEFORMATEXTENSIBLE` for 16-bit and wider.)
-        let mut probed = EXCLUSIVE_SAMPLE_FORMATS;
-        probed.sort_unstable();
-
-        let mut expected = [
-            SampleFormat::U8,
-            SampleFormat::I16,
-            SampleFormat::I24,
-            SampleFormat::I32,
-            SampleFormat::F32,
-        ];
-        expected.sort_unstable();
-
-        assert_eq!(probed.as_slice(), expected.as_slice());
-    }
-
     // A 10 ms default period and a 3 ms minimum period, in 100-nanosecond units.
     const PERIODS_HNS: (i64, i64) = (100_000, 30_000);
 
     #[test]
     fn exclusive_buffer_sizes_span_the_minimum_period_to_the_initialize_ceiling() {
+        // 5000 ms: the ceiling `Initialize` documents for an exclusive-mode pull (event-driven)
+        // client. The frames below are that duration at each rate.
+        assert_eq!(EXCLUSIVE_MAX_BUFFER_HNS, 5_000 * 10_000);
         for (sample_rate, min, max) in [(48_000, 144, 240_000), (44_100, 132, 220_500)] {
             assert_eq!(
-                period_buffer_size(PERIODS_HNS, ShareMode::Exclusive, sample_rate),
+                period_buffer_size(PERIODS_HNS, AccessMode::Exclusive, sample_rate),
                 SupportedBufferSize::Range { min, max },
                 "{sample_rate}"
             );
@@ -2344,7 +2387,7 @@ mod tests {
         // Degenerate on purpose: a shared client does not choose its own buffer size.
         for (sample_rate, frames) in [(48_000, 480), (44_100, 441), (96_000, 960)] {
             assert_eq!(
-                period_buffer_size(PERIODS_HNS, ShareMode::Shared, sample_rate),
+                period_buffer_size(PERIODS_HNS, AccessMode::Shared, sample_rate),
                 SupportedBufferSize::Range {
                     min: frames,
                     max: frames
@@ -2356,16 +2399,16 @@ mod tests {
 
     #[test]
     fn an_absent_period_reports_an_unknown_buffer_size() {
-        for (periods_hns, share_mode) in [
-            ((0, 30_000), ShareMode::Shared),
-            ((100_000, 0), ShareMode::Exclusive),
-            ((0, 0), ShareMode::Shared),
-            ((0, 0), ShareMode::Exclusive),
+        for (periods_hns, access_mode) in [
+            ((0, 30_000), AccessMode::Shared),
+            ((100_000, 0), AccessMode::Exclusive),
+            ((0, 0), AccessMode::Shared),
+            ((0, 0), AccessMode::Exclusive),
         ] {
             assert_eq!(
-                period_buffer_size(periods_hns, share_mode, 48_000),
+                period_buffer_size(periods_hns, access_mode, 48_000),
                 SupportedBufferSize::Unknown,
-                "{periods_hns:?} {share_mode:?}"
+                "{periods_hns:?} {access_mode:?}"
             );
         }
     }

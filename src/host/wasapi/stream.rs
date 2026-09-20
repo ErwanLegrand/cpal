@@ -16,11 +16,13 @@ use windows::Win32::{
     System::{Performance, SystemServices, Threading},
 };
 
-use super::{ShareMode, container_align};
+use super::AccessMode;
 use crate::{
     CallbackInfo, Data, Error, ErrorKind, FrameCount, ResultExt, SampleFormat, SampleRate,
     StreamConfig, StreamInstant, StreamTimestamp,
-    host::{ErrorCallbackArc, emit_error, equilibrium::fill_equilibrium, latch::Latch},
+    host::{
+        ErrorCallbackArc, container_align, emit_error, equilibrium::fill_equilibrium, latch::Latch,
+    },
     traits::StreamTrait,
 };
 
@@ -313,8 +315,13 @@ pub struct StreamInner {
     pub config: StreamConfig,
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
-    // The share mode the endpoint was opened in. Governs how the buffer is serviced.
-    pub share_mode: ShareMode,
+    // The access mode the endpoint was opened in. Governs how the buffer is serviced.
+    pub access_mode: AccessMode,
+    // Whether the render buffer still has to be filled before the client may be started: true
+    // until the first fill lands, and again after `stop()` resets the buffer. A pause leaves the
+    // buffer's unplayed frames in place, so it stays false and resuming plays them rather than
+    // overwriting them with a fresh fill.
+    pub render_buffer_needs_fill: bool,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
     // Raised by `stop()` and `pause()` so the audio loop skips the user callback.
@@ -595,14 +602,9 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
             Command::PlayStream => unsafe {
                 if run_context.stream.playback_state == PlaybackState::Stopped {
                     // PlayStream also fires on resume from pause, where the buffer wasn't reset
-                    // and may already hold real, unplayed data.
-                    let cold_start = match run_context.stream.client_flow {
-                        AudioClientFlow::Render { .. } => {
-                            let (available, _) = render_buffer_state(&run_context.stream)?;
-                            available > 0
-                        }
-                        AudioClientFlow::Capture { .. } => false,
-                    };
+                    // and may already hold real, unplayed data; `render_needs_prefill` tells the
+                    // two apart.
+                    let cold_start = run_context.stream.render_needs_prefill()?;
                     if cold_start {
                         // Defer Start() until the run loop lands a real fill in the buffer, so
                         // playback begins with actual audio.
@@ -635,6 +637,8 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
                         .audio_client
                         .Reset()
                         .context("Failed to reset audio client")?;
+                    // The reset buffer holds nothing real, so a later Start() must fill it first.
+                    run_context.stream.render_buffer_needs_fill = true;
                 }
             },
             Command::Terminate => {
@@ -680,8 +684,9 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error
 fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount), Error> {
     // An event-driven exclusive-mode stream is handed one whole buffer per event, and the padding
     // value is documented as carrying no useful information there. The pass writes the whole
-    // buffer, so a whole buffer also bounds what can still be queued when `stop()` reads the fill.
-    if stream.share_mode == ShareMode::Exclusive {
+    // buffer, so a whole buffer also bounds what can still be queued when `stop()` reads the fill
+    // — the wait the documentation's own exclusive-mode example makes before stopping.
+    if stream.access_mode == AccessMode::Exclusive {
         return Ok((stream.max_frames_in_buffer, stream.max_frames_in_buffer));
     }
     unsafe {
@@ -689,7 +694,34 @@ fn render_buffer_state(stream: &StreamInner) -> Result<(FrameCount, FrameCount),
             .audio_client
             .GetCurrentPadding()
             .context("Failed to get current padding")?;
-        Ok((stream.max_frames_in_buffer - padding, padding))
+        // Underflowing here would size the render buffer slice from a huge frame count.
+        let available = stream
+            .max_frames_in_buffer
+            .checked_sub(padding)
+            .ok_or_else(|| {
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    "IAudioClient::GetCurrentPadding returned more frames than the buffer holds",
+                )
+            })?;
+        Ok((available, padding))
+    }
+}
+
+impl StreamInner {
+    /// Whether a render pass still has to fill the buffer before the client may be started.
+    fn render_needs_prefill(&self) -> Result<bool, Error> {
+        match &self.client_flow {
+            // An exclusive-mode stream is handed the whole buffer on every event and cannot read
+            // its padding, so it tracks the fill itself.
+            AudioClientFlow::Render { .. } if self.access_mode == AccessMode::Exclusive => {
+                Ok(self.render_buffer_needs_fill)
+            }
+            // A shared-mode buffer is read through its padding, so a non-empty free window is
+            // what says a fill is wanted before starting, cold or resuming.
+            AudioClientFlow::Render { .. } => Ok(render_buffer_state(self)?.0 > 0),
+            AudioClientFlow::Capture { .. } => Ok(false),
+        }
     }
 }
 
@@ -710,7 +742,8 @@ fn run_input(
     // Mirrors the `container_shift != 0` gate in `process_input`, the only consumer of the
     // scratch buffer, so the sizing cannot drift from the use.
     let scratch_len = if stream.container_shift != 0 {
-        // The product is checked at build time by `buffer_size_in_frames`.
+        // `buffer_size_in_frames` rejected a buffer whose byte count does not fit a `usize`, so
+        // this product cannot wrap.
         stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize / size_of::<i32>()
     } else {
         // The scratch buffer won't be used in this case.
@@ -819,6 +852,8 @@ fn run_output(
                     break;
                 }
                 run_ctxt.stream.playback_state = PlaybackState::Playing;
+                // The buffer now holds real audio, so a resume must not refill it.
+                run_ctxt.stream.render_buffer_needs_fill = false;
             }
         }
     }
@@ -907,11 +942,18 @@ fn process_input(
     scratch_buffer: &mut [i32],
 ) -> Result<(), Error> {
     unsafe {
+        // A driver whose `GetNextPacketSize` never reports an empty packet would keep `run_input`
+        // from ever polling its commands. What is left stays queued.
+        let max_frames_per_event = stream.max_frames_in_buffer.max(1);
+        let mut frames_drained: FrameCount = 0;
         loop {
+            if frames_drained >= max_frames_per_event {
+                return Ok(());
+            }
             // `GetNextPacketSize` is documented as working with shared-mode streams only, where
             // a zero packet is also what ends the drain below. An event-driven exclusive-mode
             // stream is handed one whole buffer per event and has no packet queue to size.
-            if stream.share_mode == ShareMode::Shared {
+            if stream.access_mode == AccessMode::Shared {
                 match capture_client.GetNextPacketSize() {
                     Ok(0) => return Ok(()),
                     Ok(_) => (),
@@ -945,6 +987,10 @@ fn process_input(
                 Ok(_) => (),
             }
 
+            // Every packet the driver reports counts toward the bound checked at the top of the
+            // loop, whether or not it can be read.
+            frames_drained = frames_drained.saturating_add(frames_available);
+
             // Nothing was read, and releasing a packet of size zero is optional, so there is
             // nothing to hand back.
             if frames_available == 0 {
@@ -964,7 +1010,6 @@ fn process_input(
             let xrun = device_position != 0
                 && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
 
-            debug_assert!(!buffer.is_null());
             // Every length below is derived from this frame count, and the scratch buffer is
             // sized for a whole buffer's worth of it.
             if frames_available > stream.max_frames_in_buffer {
@@ -1028,7 +1073,7 @@ fn process_input(
 
             // Shared mode drains every packet queued for this event; exclusive mode has exactly
             // one buffer per event and no packet queue to drain.
-            if stream.share_mode == ShareMode::Exclusive {
+            if stream.access_mode == AccessMode::Exclusive {
                 return Ok(());
             }
         }
@@ -1076,9 +1121,29 @@ fn process_output(
             Err(e) => return Err(Error::from(e)),
         };
 
-        debug_assert!(!buffer.is_null());
+        // A success code is not a promise that the pointer was written; reading through a null
+        // one below would be undefined. The packet is checked out either way, so it goes back.
+        if buffer.is_null() {
+            let _ = render_client.ReleaseBuffer(0, 0);
+            return Err(Error::with_message(
+                ErrorKind::BackendError,
+                "Render packet has a frame count but no data",
+            ));
+        }
 
-        let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+        // The buffer size was bounded when the stream was built, but the request itself can still
+        // name more frames than the address space holds bytes for.
+        let byte_count =
+            match (frames_available as usize).checked_mul(stream.bytes_per_frame as usize) {
+                Some(byte_count) => byte_count,
+                None => {
+                    let _ = render_client.ReleaseBuffer(0, 0);
+                    return Err(Error::with_message(
+                        ErrorKind::BackendError,
+                        "Render packet size overflows the address space",
+                    ));
+                }
+            };
         // SAFETY: `buffer` is WASAPI's render buffer, valid for `byte_count` bytes until the
         // `ReleaseBuffer` below. Not bound to a name, so it does not overlap the slice taken
         // after the callback.

@@ -1,19 +1,19 @@
 //! Plays a 440 Hz sine wave through an endpoint opened in WASAPI exclusive mode.
 //!
 //! This example demonstrates:
-//! - Binding exclusive mode to a device with `WasapiDeviceExt::with_options(ShareMode::Exclusive)`
+//! - Binding exclusive mode to a device with `Device::with_access_mode(AccessMode::Exclusive)`
 //! - Negotiating the config and building the stream on that same configured device
 //! - Reporting the failures exclusive mode brings with it
 //!
 //! Run with: `cargo run --example exclusive`
 //!
-//! Exclusive mode needs a WASAPI endpoint; on any other device this reports that and exits.
+//! Exclusive mode needs a WASAPI endpoint; on any other device the first query on the
+//! configured device reports that and exits.
 
 use clap::Parser;
 use cpal::{
-    CallbackInfo, Error, ErrorKind, FromSample, I24, SampleFormat, SizedSample,
+    AccessMode, CallbackInfo, Error, ErrorKind, FromSample, I24, SampleFormat, SizedSample,
     SupportedStreamConfig,
-    platform::wasapi_ext::{ShareMode, WasapiDeviceExt},
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
@@ -42,13 +42,10 @@ fn main() -> anyhow::Result<()> {
     .ok_or_else(|| anyhow::Error::msg("failed to find output device"))?;
     println!("Output device: {}", device.id()?);
 
-    let exclusive = match device.with_options(ShareMode::Exclusive) {
-        Ok(exclusive) => exclusive,
-        Err(err) => {
-            report(&err);
-            return Err(anyhow::Error::msg(format!("{err}")));
-        }
-    };
+    // Binding never fails: whether the mode can be honoured shows up on the operations of the
+    // configured device — a WASAPI endpoint may refuse exclusive use, a device without one
+    // cannot offer it at all.
+    let exclusive = device.with_access_mode(AccessMode::Exclusive);
 
     // Both the query and the build go through `exclusive`: a config negotiated here and passed to
     // `device` would open shared mode instead.
