@@ -361,6 +361,37 @@ impl BufferGeometry {
     }
 }
 
+/// Scratch storage for the capture path, allocated as `i64` words so that any
+/// narrower view is alignment-safe.
+pub(crate) struct Scratch(Box<[i64]>);
+
+impl Scratch {
+    pub(crate) fn new(geometry: &BufferGeometry) -> Self {
+        Self(vec![0i64; geometry.scratch_words()].into_boxed_slice())
+    }
+
+    /// The first `len` bytes of the scratch, as a mutable byte slice.
+    ///
+    /// The words are bounded before the cast, so a `len` past the allocation panics rather than
+    /// forming an out-of-bounds slice. `u8` has no alignment requirement, so narrowing from the
+    /// `i64` words is sound.
+    pub(crate) fn as_bytes(&mut self, len: usize) -> &mut [u8] {
+        let words = &mut self.0[..len.div_ceil(size_of::<i64>())];
+        // SAFETY: `words` is in bounds and `len` fits it; `u8` is less aligned than `i64`.
+        unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), len) }
+    }
+
+    /// The first `len` `i32` samples of the scratch, as a mutable slice.
+    ///
+    /// Bounding and alignment follow [`Self::as_bytes`]: each `i64` word holds two `i32`
+    /// samples, so viewing only decreases alignment.
+    pub(crate) fn as_i32s(&mut self, len: usize) -> &mut [i32] {
+        let words = &mut self.0[..len.div_ceil(2)];
+        // SAFETY: `words` is in bounds and `len` fits it; `i32` is less aligned than `i64`.
+        unsafe { slice::from_raw_parts_mut(words.as_mut_ptr().cast::<i32>(), len) }
+    }
+}
+
 pub struct StreamInner {
     pub audio_client: Audio::IAudioClient,
     pub audio_clock: Audio::IAudioClock,
@@ -770,12 +801,10 @@ fn run_input(
     }
 
     let stream = &run_ctxt.stream;
-    // Sized in i64 words, the widest sample, so a buffer served from the scratch through any
-    // format the callback accepts stays aligned. The I24 conversion shifts its samples through
-    // it as i32s, and packets the engine marks SILENT are served from it as bytes filled with
-    // equilibrium -- filling the engine's capture buffer in place would break the contract that
-    // it is read-only to the client. A zero length allocates no backing storage.
-    let mut scratch_buffer = vec![0i64; stream.geometry.scratch_words()].into_boxed_slice();
+    // The I24 conversion shifts its samples through the scratch as i32s, and packets the engine
+    // marks SILENT are served from it as bytes filled with equilibrium -- filling the engine's
+    // capture buffer in place would break the contract that it is read-only to the client.
+    let mut scratch = Scratch::new(&stream.geometry);
 
     loop {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
@@ -800,7 +829,7 @@ fn run_input(
             &run_ctxt.stream,
             capture_client,
             data_callback,
-            &mut scratch_buffer,
+            &mut scratch,
         ) {
             emit_error(error_callback, err);
             break;
@@ -1009,7 +1038,7 @@ fn process_input(
     stream: &StreamInner,
     capture_client: &Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &CallbackInfo),
-    scratch_buffer: &mut [i64],
+    scratch: &mut Scratch,
 ) -> Result<(), Error> {
     unsafe {
         let geometry = stream.geometry;
@@ -1089,27 +1118,20 @@ fn process_input(
             let silent = flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let data = if silent {
                 // Filling the engine-owned capture buffer would violate its read-only
-                // contract, so fill the scratch instead and serve that. Bounding the slice
-                // first keeps a length error a panic rather than UB; viewing the i64 words
-                // as bytes never increases alignment, so the cast is sound.
-                let words = &mut scratch_buffer[..byte_count.div_ceil(size_of::<i64>())];
-                let zeros = slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_count);
+                // contract, so fill the scratch instead and serve that. `as_bytes` bounds the
+                // words before casting, so a length error panics rather than being UB.
+                let zeros = scratch.as_bytes(byte_count);
                 fill_equilibrium(zeros, geometry.sample_format());
                 zeros.as_mut_ptr().cast()
             } else if geometry.sample_format() == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
                 let sample_count = byte_count / size_of::<i32>();
                 // use a scratch buffer since the capture buffer isn't meant to be written.
-                // Bounding the slice first keeps a length error a panic rather than UB;
-                // viewing the i64 words as i32 samples only decreases alignment, so the cast
-                // is sound and the I24 samples stay 4-aligned.
-                let words = &mut scratch_buffer[..sample_count.div_ceil(2)];
                 // Copy through the guard's borrow so the read of the engine-owned buffer stays
-                // tied to the packet's lifetime.
-                let dst_bytes =
-                    slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_count);
-                dst_bytes.copy_from_slice(packet.bytes());
-                let dst = slice::from_raw_parts_mut(words.as_mut_ptr().cast::<i32>(), sample_count);
+                // tied to the packet's lifetime. `as_i32s` bounds the words before casting, so a
+                // length error panics rather than being UB, and the I24 samples stay 4-aligned.
+                scratch.as_bytes(byte_count).copy_from_slice(packet.bytes());
+                let dst = scratch.as_i32s(sample_count);
                 for sample in dst.iter_mut() {
                     // On signed integers, >> is an arithmetic shift,
                     // which ensures the correct upper bits get shifted in
@@ -1365,4 +1387,35 @@ fn test_buffer_geometry_derives_and_bounds() {
     let ceiling_frames = (MAX_BUFFER_BYTES / 4) as u32;
     assert!(BufferGeometry::new(ceiling_frames, 4, SampleFormat::I32).is_ok());
     assert!(BufferGeometry::new(ceiling_frames + 1, 4, SampleFormat::I32).is_err());
+}
+
+// The accessors' bound is the whole safety argument for the casts they hide: an exact-fit view
+// must come back whole, and one byte/sample past the allocation must panic instead of forming an
+// out-of-bounds slice.
+#[test]
+fn test_scratch_views_bound_before_casting() {
+    // 4 frames of I32 is 16 bytes, i.e. 2 i64 words, holding 4 i32 samples.
+    let geometry = BufferGeometry::new(4, 4, SampleFormat::I32).expect("16 bytes is plausible");
+    let mut scratch = Scratch::new(&geometry);
+
+    assert_eq!(scratch.as_bytes(16).len(), 16);
+    assert_eq!(scratch.as_i32s(4).len(), 4);
+    // The i64 words are preserved, so an i32 view is 4-aligned as required.
+    assert_eq!(scratch.as_i32s(4).as_ptr() as usize % align_of::<i64>(), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_scratch_bytes_over_length_panics() {
+    let geometry = BufferGeometry::new(4, 4, SampleFormat::I32).expect("16 bytes is plausible");
+    let mut scratch = Scratch::new(&geometry);
+    let _ = scratch.as_bytes(17);
+}
+
+#[test]
+#[should_panic]
+fn test_scratch_i32s_over_length_panics() {
+    let geometry = BufferGeometry::new(4, 4, SampleFormat::I32).expect("16 bytes is plausible");
+    let mut scratch = Scratch::new(&geometry);
+    let _ = scratch.as_i32s(5);
 }
