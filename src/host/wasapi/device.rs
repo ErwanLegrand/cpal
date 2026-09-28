@@ -221,7 +221,7 @@ struct MixFormat {
     storage: WaveFormatExPtr,
     /// Whether `cbSize` covers the `WAVEFORMATEXTENSIBLE` extension, so the bytes past the
     /// `WAVEFORMATEX` header belong to the allocation.
-    extensible: bool,
+    extension_present: bool,
 }
 
 impl MixFormat {
@@ -239,7 +239,7 @@ impl MixFormat {
         let extensible = unsafe { (*storage.0).cbSize } >= WAVEFORMATEXTENSIBLE_EXTRA_BYTES;
         Ok(Self {
             storage,
-            extensible,
+            extension_present: extensible,
         })
     }
 
@@ -253,7 +253,7 @@ impl MixFormat {
     fn extensible(&self) -> Option<&Audio::WAVEFORMATEXTENSIBLE> {
         // Safety: the constructor only stores `true` when `cbSize` covers the extension, so the
         // bytes past the `WAVEFORMATEX` header are within the allocation.
-        self.extensible
+        self.extension_present
             .then(|| unsafe { &*self.storage.0.cast::<Audio::WAVEFORMATEXTENSIBLE>() })
     }
 }
@@ -1534,7 +1534,7 @@ fn buffer_geometry(
 fn shared_mode_period_frames(
     audio_client: &Audio::IAudioClient,
     sample_rate: SampleRate,
-    max_frames_in_buffer: FrameCount,
+    max_frames: FrameCount,
 ) -> FrameCount {
     let mut default_period = 0i64;
     if unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), None) }.is_ok()
@@ -1542,7 +1542,7 @@ fn shared_mode_period_frames(
     {
         buffer_duration_to_frames(default_period, sample_rate)
     } else {
-        max_frames_in_buffer
+        max_frames
     }
 }
 

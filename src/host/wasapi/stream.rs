@@ -318,8 +318,6 @@ impl BufferGeometry {
         bytes_per_frame: u16,
         sample_format: SampleFormat,
     ) -> Result<Self, Error> {
-        // The stream derives byte counts from these two; keep the product within the address
-        // space and under the allocation ceiling.
         let buffer_bytes = (frames as usize).checked_mul(bytes_per_frame as usize);
         if buffer_bytes.is_none_or(|bytes| bytes > MAX_BUFFER_BYTES) {
             return Err(Error::with_message(
@@ -1010,10 +1008,11 @@ struct CapturePacket<'a> {
 impl CapturePacket<'_> {
     /// The packet's bytes. Borrowing the guard means the slice cannot outlive it.
     ///
-    /// Precondition: `frames <= max_frames()`, checked before the frame length is derived.
+    /// Preconditions: the frame count was validated by `BufferGeometry` (so `frames <=` the
+    /// geometry's `max_frames()`), and `buffer` is non-null for a non-empty packet.
     fn bytes(&self) -> &[u8] {
-        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is readable for
-        // `byte_len(frames)` bytes.
+        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is non-null for a
+        // non-empty packet and readable for `byte_len(frames)` bytes.
         unsafe { slice::from_raw_parts(self.buffer, self.geometry.byte_len(self.frames)) }
     }
 
@@ -1140,7 +1139,8 @@ fn process_input(
 
                 dst.as_mut_ptr().cast()
             } else {
-                packet.bytes().as_ptr().cast_mut().cast()
+                // The guard already holds the writable buffer pointer; use it directly.
+                packet.buffer.cast::<()>()
             };
 
             let len = geometry.sample_len(frames_available);
@@ -1172,9 +1172,12 @@ struct RenderPacket<'a> {
 
 impl RenderPacket<'_> {
     /// The packet's bytes. Borrowing the guard means the slice cannot outlive it.
+    ///
+    /// Preconditions: the frame count was validated by `BufferGeometry` (so `frames <=` the
+    /// geometry's `max_frames()`), and `buffer` is non-null for a non-empty packet.
     fn bytes_mut(&mut self) -> &mut [u8] {
-        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is writable for
-        // `byte_len(frames)` bytes.
+        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is non-null for a
+        // non-empty packet and writable for `byte_len(frames)` bytes.
         unsafe { slice::from_raw_parts_mut(self.buffer, self.geometry.byte_len(self.frames)) }
     }
 
