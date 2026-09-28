@@ -140,7 +140,7 @@ let config = StreamConfig {
 };
 ```
 
-**Impact:** Wrap literal or computed channel counts in `NonZeroU16::new(..)`; use [`NonZeroU16::MIN`] for mono. Reading the field yields a `NonZeroU16`, so use `.get()` where a `u16` is needed. `SupportedStreamConfig` and its accessors are unchanged, so code that obtains its config through `SupportedStreamConfig::config()` or `.into()` needs no change. On `wasm32` with the `wasm-bindgen` feature, `channels` is no longer exposed as a JavaScript field: `wasm_bindgen` has no ABI for `NonZeroU16`.
+**Impact:** Wrap literal or computed channel counts in `NonZeroU16::new(..)`; use [`NonZeroU16::MIN`] for mono. Reading the field yields a `NonZeroU16`, so use `.get()` where a `u16` is needed. `SupportedStreamConfig` and its accessors are unchanged, so code that obtains its config through `SupportedStreamConfig::config()` or `.into()` needs no change. A hand-built `SupportedStreamConfig` with zero channels now makes `config()`/`.into()` panic; previously it produced a `StreamConfig` that was rejected at stream build with `ErrorKind::InvalidInput`. On `wasm32` with the `wasm-bindgen` feature, `channels` is no longer exposed as a JavaScript field: `wasm_bindgen` has no ABI for `NonZeroU16`.
 
 **Why:** Zero channels is invalid on every backend, unlike the other `StreamConfig` limits, which are backend- and device-specific. It is therefore the one channel limit a type can express, and encoding it removes a runtime failure mode rather than reporting it.
 

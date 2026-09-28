@@ -224,6 +224,7 @@ pub use platform::{
     SupportedOutputConfigs, available_hosts, default_host, host_from_id,
 };
 pub use sample_format::{FromSample, I24, Sample, SampleFormat, SizedSample, U24};
+use std::num::NonZeroU16;
 #[cfg(all(
     target_arch = "wasm32",
     any(target_os = "emscripten", target_os = "unknown"),
@@ -251,8 +252,6 @@ pub type OutputDevices<I> = DevicesFiltered<I>;
 
 /// Number of channels.
 pub type ChannelCount = u16;
-
-use std::num::NonZeroU16;
 
 /// The number of samples processed per second for a single channel of audio.
 pub type SampleRate = u32;
