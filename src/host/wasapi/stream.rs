@@ -720,9 +720,11 @@ fn run_input(
             ControlFlow::Continue(false) => continue,
             ControlFlow::Continue(true) => {}
         }
-        let capture_client = match run_ctxt.stream.client_flow {
-            AudioClientFlow::Capture { ref capture_client } => capture_client.clone(),
-            _ => unreachable!(),
+        // `client_flow` fixes the direction at construction, so an input stream always holds the
+        // capture client and this borrow cannot fail. It stays inside the loop because
+        // `process_commands_and_await_signal` takes `&mut RunContext` each iteration.
+        let AudioClientFlow::Capture { capture_client } = &run_ctxt.stream.client_flow else {
+            return;
         };
         if let Err(err) = process_input(
             &run_ctxt.stream,
@@ -777,9 +779,11 @@ fn run_output(
             ControlFlow::Continue(false) => continue,
             ControlFlow::Continue(true) => {}
         }
-        let render_client = match run_ctxt.stream.client_flow {
-            AudioClientFlow::Render { ref render_client } => render_client.clone(),
-            _ => unreachable!(),
+        // `client_flow` fixes the direction at construction, so an output stream always holds the
+        // render client and this borrow cannot fail. It stays inside the loop because
+        // `process_commands_and_await_signal` takes `&mut RunContext` each iteration.
+        let AudioClientFlow::Render { render_client } = &run_ctxt.stream.client_flow else {
+            return;
         };
         if let Err(err) = process_output(
             &run_ctxt.stream,
@@ -913,7 +917,7 @@ impl Drop for CapturePacket<'_> {
 // The loop for processing pending input data.
 fn process_input(
     stream: &StreamInner,
-    capture_client: Audio::IAudioCaptureClient,
+    capture_client: &Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &CallbackInfo),
     scratch_buffer: &mut [i64],
 ) -> Result<(), Error> {
@@ -948,7 +952,7 @@ fn process_input(
                 Some(&mut qpc_position),
             )?;
             let packet = CapturePacket {
-                capture_client: &capture_client,
+                capture_client,
                 frames: frames_available,
             };
 
@@ -1060,7 +1064,7 @@ impl Drop for RenderPacket<'_> {
 // The loop for writing output data.
 fn process_output(
     stream: &StreamInner,
-    render_client: Audio::IAudioRenderClient,
+    render_client: &Audio::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &CallbackInfo),
     clock_frequency: u64,
     frames_written: &mut u64,
@@ -1096,7 +1100,7 @@ fn process_output(
         // drop is what releases the buffer back to the engine, so it must exist first. The
         // capture side constructs its guard immediately after GetBuffer for the same reason.
         let mut packet = RenderPacket {
-            render_client: &render_client,
+            render_client,
             frames: frames_available,
         };
 
