@@ -215,36 +215,67 @@ const _: () = assert!(
         == WAVEFORMATEXTENSIBLE_EXTRA_BYTES as usize
 );
 
-// Get a cpal Format from a WAVEFORMATEX.
-//
-// Safety: `waveformatex_ptr` must point to a readable `WAVEFORMATEX` followed by the
-// `cbSize` extra bytes its header declares.
-unsafe fn format_from_waveformatex_ptr(
-    waveformatex_ptr: *const Audio::WAVEFORMATEX,
+/// A mix format obtained from `IAudioClient::GetMixFormat`, owning its
+/// `CoTaskMemAlloc`ed storage and validated far enough to read the extension.
+struct MixFormat {
+    storage: WaveFormatExPtr,
+    /// Whether `cbSize` covers the `WAVEFORMATEXTENSIBLE` extension, so the bytes past the
+    /// `WAVEFORMATEX` header belong to the allocation.
+    extensible: bool,
+}
+
+impl MixFormat {
+    /// The only constructor.
+    ///
+    /// # Safety
+    ///
+    /// `client` must be a valid, live `IAudioClient`.
+    unsafe fn from_audio_client(client: &Audio::IAudioClient) -> Result<Self, Error> {
+        let storage = unsafe { client.GetMixFormat() }
+            .map(WaveFormatExPtr)
+            .context("Failed to get mix format")?;
+        // The extension is only there to be read if `cbSize` accounts for it. Checked once here
+        // so no parse re-derives it.
+        let extensible = unsafe { (*storage.0).cbSize } >= WAVEFORMATEXTENSIBLE_EXTRA_BYTES;
+        Ok(Self {
+            storage,
+            extensible,
+        })
+    }
+
+    fn as_waveformatex(&self) -> &Audio::WAVEFORMATEX {
+        // Safety: `GetMixFormat` succeeded, so `storage` holds a readable `WAVEFORMATEX`, and
+        // the field keeps the allocation alive for this borrow.
+        unsafe { &*self.storage.0 }
+    }
+
+    /// `Some` only when `cbSize` covers the extension.
+    fn extensible(&self) -> Option<&Audio::WAVEFORMATEXTENSIBLE> {
+        // Safety: the constructor only stores `true` when `cbSize` covers the extension, so the
+        // bytes past the `WAVEFORMATEX` header are within the allocation.
+        self.extensible
+            .then(|| unsafe { &*self.storage.0.cast::<Audio::WAVEFORMATEXTENSIBLE>() })
+    }
+}
+
+// Get a cpal Format from a `MixFormat`.
+fn format_from_waveformatex_ptr(
+    format: &MixFormat,
     audio_client: &Audio::IAudioClient,
 ) -> Option<SupportedStreamConfig> {
     fn cmp_guid(a: &GUID, b: &GUID) -> bool {
         (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
     }
-    let sample_format = match unsafe {
-        (
-            (*waveformatex_ptr).wBitsPerSample,
-            (*waveformatex_ptr).wFormatTag as u32,
-        )
-    } {
+    let waveformatex = format.as_waveformatex();
+    let sample_format = match (waveformatex.wBitsPerSample, waveformatex.wFormatTag as u32) {
         (8, Audio::WAVE_FORMAT_PCM) => SampleFormat::U8,
         (16, Audio::WAVE_FORMAT_PCM) => SampleFormat::I16,
         (32, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F32,
         (64, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F64,
         (n_bits, KernelStreaming::WAVE_FORMAT_EXTENSIBLE) => {
-            // The extension is only there to be read if `cbSize` accounts for it.
-            if unsafe { (*waveformatex_ptr).cbSize } < WAVEFORMATEXTENSIBLE_EXTRA_BYTES {
-                return None;
-            }
-
-            let waveformatextensible_ptr = waveformatex_ptr as *const Audio::WAVEFORMATEXTENSIBLE;
-            let sub = unsafe { (*waveformatextensible_ptr).SubFormat };
-            let valid_bits = unsafe { (*waveformatextensible_ptr).Samples.wValidBitsPerSample };
+            let waveformatextensible = format.extensible()?;
+            let sub = waveformatextensible.SubFormat;
+            let valid_bits = unsafe { waveformatextensible.Samples.wValidBitsPerSample };
 
             if cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
                 match n_bits {
@@ -270,7 +301,7 @@ unsafe fn format_from_waveformatex_ptr(
         _ => return None,
     };
 
-    let sample_rate = unsafe { (*waveformatex_ptr).nSamplesPerSec };
+    let sample_rate = waveformatex.nSamplesPerSec;
 
     // GetBufferSizeLimits is only used for Hardware-Offloaded Audio
     // Processing, which was added in Windows 8, which places hardware
@@ -288,7 +319,7 @@ unsafe fn format_from_waveformatex_ptr(
         .cast::<Audio::IAudioClient2>()
         .and_then(|audio_client| unsafe {
             audio_client.GetBufferSizeLimits(
-                waveformatex_ptr,
+                ptr::from_ref(waveformatex),
                 true,
                 &mut min_buffer_duration,
                 &mut max_buffer_duration,
@@ -305,13 +336,13 @@ unsafe fn format_from_waveformatex_ptr(
         SupportedBufferSize::Unknown
     };
 
-    let format = SupportedStreamConfig {
-        channels: unsafe { (*waveformatex_ptr).nChannels } as _,
+    let supported_format = SupportedStreamConfig {
+        channels: waveformatex.nChannels as _,
         sample_rate,
         buffer_size,
         sample_format,
     };
-    Some(format)
+    Some(supported_format)
 }
 
 unsafe impl Send for Device {}
@@ -656,16 +687,13 @@ impl Device {
         let client = &lock.as_ref().unwrap().0;
 
         unsafe {
-            // Retrieve the pointer to the default WAVEFORMATEX.
-            let default_waveformatex_ptr = client
-                .GetMixFormat()
-                .map(WaveFormatExPtr)
-                .context("Failed to get mix format")?;
+            // Retrieve the default mix format.
+            let mix_format = MixFormat::from_audio_client(client)?;
 
             // If the default format can't succeed we have no hope of finding other formats.
             if !is_format_supported(
                 client,
-                default_waveformatex_ptr.0,
+                mix_format.as_waveformatex(),
                 Audio::AUDCLNT_SHAREMODE_SHARED,
             )? {
                 return Err(Error::with_message(
@@ -674,7 +702,7 @@ impl Device {
                 ));
             }
 
-            let format = match format_from_waveformatex_ptr(default_waveformatex_ptr.0, client) {
+            let format = match format_from_waveformatex_ptr(&mix_format, client) {
                 Some(fmt) => fmt,
                 None => {
                     return Err(Error::with_message(
@@ -795,13 +823,10 @@ impl Device {
         let client = &lock.as_ref().unwrap().0;
 
         unsafe {
-            let format_ptr = client
-                .GetMixFormat()
-                .map(WaveFormatExPtr)
-                .context("Failed to get mix format")?;
+            let mix_format = MixFormat::from_audio_client(client)?;
 
             let mut config =
-                format_from_waveformatex_ptr(format_ptr.0, client).ok_or_else(|| {
+                format_from_waveformatex_ptr(&mix_format, client).ok_or_else(|| {
                     Error::with_message(
                         ErrorKind::UnsupportedConfig,
                         "Device audio format could not be mapped to a supported format",
