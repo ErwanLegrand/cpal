@@ -295,6 +295,69 @@ pub enum PlaybackState {
     Playing,
 }
 
+// Bytes a ring buffer may occupy before the engine report is treated as nonsense. Shared by the
+// geometry below; an absolute ceiling is required because the requested size is caller-supplied.
+const MAX_BUFFER_BYTES: usize = 1 << 30; // 1 GiB
+
+/// Geometry of the WASAPI ring buffer. Constructing one proves the frame count, the
+/// bytes-per-frame and the sample format are mutually consistent and that every byte length
+/// derived from them fits `usize` and the allocation ceiling.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct BufferGeometry {
+    max_frames: FrameCount,
+    bytes_per_frame: u16,
+    sample_format: SampleFormat,
+}
+
+impl BufferGeometry {
+    /// The only constructor. Performs the arithmetic checks currently in
+    /// `buffer_geometry`.
+    pub(crate) fn new(
+        frames: FrameCount,
+        bytes_per_frame: u16,
+        sample_format: SampleFormat,
+    ) -> Result<Self, Error> {
+        // The stream derives byte counts from these two; keep the product within the address
+        // space and under the allocation ceiling.
+        let buffer_bytes = (frames as usize).checked_mul(bytes_per_frame as usize);
+        if buffer_bytes.is_none_or(|bytes| bytes > MAX_BUFFER_BYTES) {
+            return Err(Error::with_message(
+                ErrorKind::BackendError,
+                "Audio buffer size overflows the address space or exceeds the 1 GiB ceiling",
+            ));
+        }
+        Ok(Self {
+            max_frames: frames,
+            bytes_per_frame,
+            sample_format,
+        })
+    }
+
+    pub(crate) fn max_frames(&self) -> FrameCount {
+        self.max_frames
+    }
+
+    pub(crate) fn sample_format(&self) -> SampleFormat {
+        self.sample_format
+    }
+
+    /// Bytes occupied by `frames` frames.
+    pub(crate) fn byte_len(&self, frames: FrameCount) -> usize {
+        frames as usize * self.bytes_per_frame as usize
+    }
+
+    /// Samples in `frames` frames, matching the `len` a `Data` views.
+    pub(crate) fn sample_len(&self, frames: FrameCount) -> usize {
+        self.byte_len(frames) / self.sample_format.sample_size()
+    }
+
+    /// Words of the whole buffer, sized for the widest sample so any format's scratch view
+    /// stays aligned.
+    pub(crate) fn scratch_words(&self) -> usize {
+        self.byte_len(self.max_frames).div_ceil(size_of::<i64>())
+    }
+}
+
 pub struct StreamInner {
     pub audio_client: Audio::IAudioClient,
     pub audio_clock: Audio::IAudioClock,
@@ -303,16 +366,13 @@ pub struct StreamInner {
     pub event: Foundation::HANDLE,
     // Current playback state of the stream.
     pub playback_state: PlaybackState,
-    // Number of frames of audio data in the underlying buffer allocated by WASAPI.
-    pub max_frames_in_buffer: FrameCount,
+    // Geometry of the underlying buffer allocated by WASAPI: frames, bytes per frame and the
+    // sample format, validated together at construction.
+    pub geometry: BufferGeometry,
     // Callback size in frames.
     pub period_frames: FrameCount,
-    // Number of bytes that each frame occupies.
-    pub bytes_per_frame: u16,
     // The configuration with which the stream was created.
     pub config: StreamConfig,
-    // The sample format with which the stream was created.
-    pub sample_format: SampleFormat,
     // Hardware pipeline latency.
     pub stream_latency: Duration,
     // Raised by `stop()` and `pause()` so the audio loop skips the user callback.
@@ -680,7 +740,8 @@ fn get_available_frames(stream: &StreamInner) -> Result<(FrameCount, FrameCount)
             .context("Failed to get current padding")?;
         // Underflowing here would size the render buffer slice from a huge frame count.
         let available = stream
-            .max_frames_in_buffer
+            .geometry
+            .max_frames()
             .checked_sub(padding)
             .ok_or_else(|| {
                 Error::with_message(
@@ -711,8 +772,7 @@ fn run_input(
     // it as i32s, and packets the engine marks SILENT are served from it as bytes filled with
     // equilibrium -- filling the engine's capture buffer in place would break the contract that
     // it is read-only to the client. A zero length allocates no backing storage.
-    let scratch_len = stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize;
-    let mut scratch_buffer = vec![0i64; scratch_len.div_ceil(size_of::<i64>())].into_boxed_slice();
+    let mut scratch_buffer = vec![0i64; stream.geometry.scratch_words()].into_boxed_slice();
 
     loop {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
@@ -936,11 +996,12 @@ fn process_input(
     scratch_buffer: &mut [i64],
 ) -> Result<(), Error> {
     unsafe {
+        let geometry = stream.geometry;
         // `GetNextPacketSize` is implemented by the audio engine and reports an empty packet
         // once the ring is drained, but a data callback slower than realtime refills the ring
         // while this loop runs, so the drain never reaches zero -- and the bound guarantees
         // `run_input` still polls its commands. What is left stays queued.
-        let max_frames_per_event = stream.max_frames_in_buffer.max(1);
+        let max_frames_per_event = geometry.max_frames().max(1);
         let mut frames_drained: FrameCount = 0;
         loop {
             if frames_drained >= max_frames_per_event {
@@ -992,13 +1053,13 @@ fn process_input(
 
             // Every length below is derived from this frame count, and the scratch buffer is
             // sized for a whole buffer's worth of it.
-            if frames_available > stream.max_frames_in_buffer {
+            if frames_available > geometry.max_frames() {
                 return Err(Error::with_message(
                     ErrorKind::BackendError,
                     "IAudioCaptureClient::GetBuffer returned more frames than the buffer holds",
                 ));
             }
-            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+            let byte_count = geometry.byte_len(frames_available);
             // A packet marked SILENT may hold uninitialized data: the engine is not required to
             // have written it. Fill equilibrium into the scratch buffer and serve that instead,
             // so the callback and the i24 copy see zeros, not stale driver memory -- and the
@@ -1011,9 +1072,9 @@ fn process_input(
                 // as bytes never increases alignment, so the cast is sound.
                 let words = &mut scratch_buffer[..byte_count.div_ceil(size_of::<i64>())];
                 let zeros = slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_count);
-                fill_equilibrium(zeros, stream.sample_format);
+                fill_equilibrium(zeros, geometry.sample_format());
                 zeros.as_mut_ptr().cast()
-            } else if stream.sample_format == SampleFormat::I24 {
+            } else if geometry.sample_format() == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
                 let sample_count = byte_count / size_of::<i32>();
                 let source_data = slice::from_raw_parts(buffer.cast(), sample_count);
@@ -1035,8 +1096,8 @@ fn process_input(
                 buffer.cast()
             };
 
-            let len = byte_count / stream.sample_format.sample_size();
-            let data = Data::from_parts(data, len, stream.sample_format);
+            let len = geometry.sample_len(frames_available);
+            let data = Data::from_parts(data, len, geometry.sample_format());
 
             if !stream.skip_callback.load(Ordering::Relaxed) {
                 // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
@@ -1108,6 +1169,7 @@ fn process_output(
     }
 
     unsafe {
+        let geometry = stream.geometry;
         let buffer = render_client.GetBuffer(frames_available)?;
 
         // Bind the packet before the assert: a failed debug assert panics, and the packet's
@@ -1120,13 +1182,13 @@ fn process_output(
 
         debug_assert!(!buffer.is_null());
 
-        let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+        let byte_count = geometry.byte_len(frames_available);
         let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, stream.sample_format);
+        fill_equilibrium(buffer_slice, geometry.sample_format());
 
         let data = buffer as *mut ();
-        let len = byte_count / stream.sample_format.sample_size();
-        let mut data = Data::from_parts(data, len, stream.sample_format);
+        let len = geometry.sample_len(frames_available);
+        let mut data = Data::from_parts(data, len, geometry.sample_format());
         let sample_rate = stream.config.sample_rate;
         let timestamp =
             match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
@@ -1146,7 +1208,7 @@ fn process_output(
             },
         );
 
-        if stream.sample_format == SampleFormat::I24 {
+        if geometry.sample_format() == SampleFormat::I24 {
             // WASAPI stores i24 in the upper bits
             #[expect(
                 clippy::cast_ptr_alignment,
@@ -1240,4 +1302,24 @@ fn output_timestamp(
         callback,
         device: playback,
     })
+}
+
+// Pins the guard `BufferGeometry::new` carries for the whole stream: the derived lengths and the
+// accept/reject boundary of the 1 GiB ceiling. A misconfigured driver is the only way to see it.
+#[test]
+fn test_buffer_geometry_derives_and_bounds() {
+    // 2ch I16 at 48 kHz: 4 bytes per frame.
+    let geometry = BufferGeometry::new(1024, 4, SampleFormat::I16).expect("4 KiB is plausible");
+    assert_eq!(geometry.max_frames(), 1024);
+    assert_eq!(geometry.byte_len(1024), 4096);
+    assert_eq!(geometry.sample_len(1024), 2048);
+    assert_eq!(geometry.scratch_words(), 512);
+
+    // A product past the 1 GiB ceiling (and, on a 32-bit target, one that overflows `usize`).
+    assert!(BufferGeometry::new(u32::MAX, u16::MAX, SampleFormat::I16).is_err());
+
+    // The ceiling itself is accepted; one frame past it is not.
+    let ceiling_frames = (MAX_BUFFER_BYTES / 4) as u32;
+    assert!(BufferGeometry::new(ceiling_frames, 4, SampleFormat::I32).is_ok());
+    assert!(BufferGeometry::new(ceiling_frames + 1, 4, SampleFormat::I32).is_err());
 }

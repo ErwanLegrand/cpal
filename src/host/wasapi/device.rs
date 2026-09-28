@@ -37,7 +37,9 @@ use windows::{
     core::{GUID, Interface},
 };
 
-use super::stream::{AudioClientFlow, DefaultDeviceMonitor, PlaybackState, Stream, StreamInner};
+use super::stream::{
+    AudioClientFlow, BufferGeometry, DefaultDeviceMonitor, PlaybackState, Stream, StreamInner,
+};
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 use crate::{host::com, traits::DeviceTrait};
 
@@ -912,15 +914,16 @@ impl Device {
                 format_attempt.Format
             };
 
-            let max_frames_in_buffer = buffer_size_in_frames(
+            let geometry = buffer_geometry(
                 &audio_client,
                 config.buffer_size,
                 config.sample_rate,
                 waveformatex.nBlockAlign,
+                sample_format,
             )?;
 
             let period_frames =
-                shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
+                shared_mode_period_frames(&audio_client, config.sample_rate, geometry.max_frames());
 
             // Creating the event that will be signalled whenever we need to submit some samples.
             let event =
@@ -957,11 +960,9 @@ impl Device {
                 client_flow,
                 event,
                 playback_state: PlaybackState::default(),
-                max_frames_in_buffer,
+                geometry,
                 period_frames,
-                bytes_per_frame: waveformatex.nBlockAlign,
                 config,
-                sample_format,
                 stream_latency,
                 skip_callback: Arc::new(AtomicBool::new(false)),
                 fill_usec: Arc::new(AtomicU64::new(0)),
@@ -1019,15 +1020,16 @@ impl Device {
                 format_attempt.Format
             };
 
-            let max_frames_in_buffer = buffer_size_in_frames(
+            let geometry = buffer_geometry(
                 &audio_client,
                 config.buffer_size,
                 config.sample_rate,
                 waveformatex.nBlockAlign,
+                sample_format,
             )?;
 
             let period_frames =
-                shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
+                shared_mode_period_frames(&audio_client, config.sample_rate, geometry.max_frames());
 
             // Creating the event that will be signalled whenever we need to submit some samples.
             let event =
@@ -1064,11 +1066,9 @@ impl Device {
                 client_flow,
                 event,
                 playback_state: PlaybackState::default(),
-                max_frames_in_buffer,
+                geometry,
                 period_frames,
-                bytes_per_frame: waveformatex.nBlockAlign,
                 config,
-                sample_format,
                 stream_latency,
                 skip_callback: Arc::new(AtomicBool::new(false)),
                 fill_usec: Arc::new(AtomicU64::new(0)),
@@ -1467,15 +1467,15 @@ fn as_waveformatex_ptr(format: &Audio::WAVEFORMATEXTENSIBLE) -> *const Audio::WA
 // nonsense. The headroom cannot stand alone: `requested` is caller-supplied, so without an
 // absolute ceiling a wild request plus a wild report admits a multi-gigabyte buffer.
 const BUFFER_HEADROOM_SECONDS: u32 = 10;
-const MAX_BUFFER_BYTES: usize = 1 << 30; // 1 GiB
 
-/// Get the size of the ring buffer WASAPI allocated, rejecting implausible values.
-fn buffer_size_in_frames(
+/// Get the geometry of the ring buffer WASAPI allocated, rejecting implausible values.
+fn buffer_geometry(
     audio_client: &Audio::IAudioClient,
     buffer_size: BufferSize,
     sample_rate: SampleRate,
     bytes_per_frame: u16,
-) -> Result<FrameCount, Error> {
+    sample_format: SampleFormat,
+) -> Result<BufferGeometry, Error> {
     let requested = match buffer_size {
         BufferSize::Fixed(frames) => frames,
         BufferSize::Default => 0,
@@ -1502,16 +1502,7 @@ fn buffer_size_in_frames(
             ),
         ));
     }
-    // The stream derives byte counts from these two; keep the product within the address space
-    // and under the allocation ceiling.
-    let buffer_bytes = (max_frames_in_buffer as usize).checked_mul(bytes_per_frame as usize);
-    if buffer_bytes.is_none_or(|bytes| bytes > MAX_BUFFER_BYTES) {
-        return Err(Error::with_message(
-            ErrorKind::BackendError,
-            "Audio buffer size overflows the address space or exceeds the 1 GiB ceiling",
-        ));
-    }
-    Ok(max_frames_in_buffer)
+    BufferGeometry::new(max_frames_in_buffer, bytes_per_frame, sample_format)
 }
 
 /// Get the default device period in frames for a shared-mode stream.
