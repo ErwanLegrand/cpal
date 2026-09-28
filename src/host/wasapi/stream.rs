@@ -724,6 +724,13 @@ fn run_input(
         // capture client and this borrow cannot fail. It stays inside the loop because
         // `process_commands_and_await_signal` takes `&mut RunContext` each iteration.
         let AudioClientFlow::Capture { capture_client } = &run_ctxt.stream.client_flow else {
+            emit_error(
+                error_callback,
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    "The input loop was entered with a stream that has no capture client",
+                ),
+            );
             return;
         };
         if let Err(err) = process_input(
@@ -783,6 +790,13 @@ fn run_output(
         // render client and this borrow cannot fail. It stays inside the loop because
         // `process_commands_and_await_signal` takes `&mut RunContext` each iteration.
         let AudioClientFlow::Render { render_client } = &run_ctxt.stream.client_flow else {
+            emit_error(
+                error_callback,
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    "The output loop was entered with a stream that has no render client",
+                ),
+            );
             return;
         };
         if let Err(err) = process_output(
