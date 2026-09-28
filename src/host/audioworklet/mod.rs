@@ -6,6 +6,7 @@
 use std::{
     cell::RefCell,
     fmt,
+    num::NonZeroU16,
     rc::Rc,
     sync::{
         Arc,
@@ -107,7 +108,7 @@ fn supported_render_quantum_range(sample_rate: SampleRate) -> SupportedBufferSiz
 /// Checks shared by both `build_input_stream_raw` and `build_output_stream_raw`.
 fn validate_config(config: &StreamConfig, sample_format: SampleFormat) -> Result<(), Error> {
     crate::validate_stream_config(config)?;
-    if config.channels > MAX_CHANNELS {
+    if config.channels.get() > MAX_CHANNELS {
         return Err(Error::with_message(
             ErrorKind::UnsupportedConfig,
             format!(
@@ -156,13 +157,20 @@ fn validate_duplex_config(
     input_sample_format: SampleFormat,
     output_sample_format: SampleFormat,
 ) -> Result<(), Error> {
-    let per_direction = |channels| StreamConfig {
-        channels,
-        sample_rate: config.sample_rate,
-        buffer_size: config.buffer_size,
+    let per_direction = |channels: ChannelCount| -> Result<StreamConfig, Error> {
+        Ok(StreamConfig {
+            channels: NonZeroU16::new(channels).ok_or_else(|| {
+                Error::with_message(ErrorKind::InvalidInput, "channel count must be at least 1")
+            })?,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        })
     };
-    validate_config(&per_direction(config.input_channels), input_sample_format)?;
-    validate_config(&per_direction(config.output_channels), output_sample_format)
+    validate_config(&per_direction(config.input_channels)?, input_sample_format)?;
+    validate_config(
+        &per_direction(config.output_channels)?,
+        output_sample_format,
+    )
 }
 
 /// The full matrix of channel counts x sample rates; identical for input and output, since
@@ -351,7 +359,7 @@ impl DeviceTrait for Device {
         validate_config(&config, sample_format)?;
         let mut data_callback = crate::host::monotonic_input_callback(data_callback);
 
-        let n_channels = config.channels as u32;
+        let n_channels = config.channels.get() as u32;
 
         let stream_opts = web_sys::AudioContextOptions::new();
         stream_opts.set_sample_rate(config.sample_rate as f32);
@@ -617,7 +625,7 @@ impl DeviceTrait for Device {
                 .and_then(|v| v.as_f64())
                 .map(|v| v as u64);
 
-        if config.channels as u32 > destination.max_channel_count() {
+        if config.channels.get() as u32 > destination.max_channel_count() {
             return Err(Error::with_message(
                 ErrorKind::UnsupportedConfig,
                 format!(
@@ -627,7 +635,7 @@ impl DeviceTrait for Device {
                 ),
             ));
         }
-        destination.set_channel_count(config.channels as u32);
+        destination.set_channel_count(config.channels.get() as u32);
 
         let initial_quantum = actual_render_quantum.unwrap_or(match config.buffer_size {
             BufferSize::Fixed(n) => n as u64,

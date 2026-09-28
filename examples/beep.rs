@@ -125,7 +125,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let sample_rate = config.sample_rate as f32;
-    let channels = config.channels as usize;
+    let channels = config.channels.get() as usize;
 
     // Produce a sinusoid of maximum amplitude.
     let mut sample_clock = 0f32;

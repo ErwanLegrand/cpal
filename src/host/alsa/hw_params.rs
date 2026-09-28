@@ -175,7 +175,7 @@ fn init_hw_params<'a>(
     hw_params.set_format(alsa_format)?;
 
     hw_params.set_rate(config.sample_rate, alsa::ValueOr::Nearest)?;
-    hw_params.set_channels(config.channels as u32)?;
+    hw_params.set_channels(config.channels.get() as u32)?;
     Ok(hw_params)
 }
 

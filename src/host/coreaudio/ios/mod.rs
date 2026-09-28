@@ -768,6 +768,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{BufferSize, SampleRate, StreamConfig};
+    use std::num::NonZeroU16;
 
     #[test]
     fn test_ios_fixed_buffer_size() {
@@ -775,7 +776,7 @@ mod tests {
         let device = host.default_output_device().unwrap();
 
         let config = StreamConfig {
-            channels: 2,
+            channels: NonZeroU16::new(2).unwrap(),
             sample_rate: SampleRate(48000),
             buffer_size: BufferSize::Fixed(512),
         };

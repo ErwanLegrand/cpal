@@ -734,7 +734,7 @@ where
         #[cfg(all(target_os = "linux", feature = "realtime"))]
         rt_promoter,
     };
-    let channels = config.channels as _;
+    let channels = config.channels.get() as _;
     let rate = config.sample_rate as _;
     let stream = StreamRc::new(
         core.clone(),
@@ -1009,7 +1009,7 @@ where
         rt_promoter,
     };
 
-    let channels = config.channels as _;
+    let channels = config.channels.get() as _;
     let rate = config.sample_rate as _;
     let stream = StreamRc::new(
         core.clone(),

@@ -561,7 +561,7 @@ impl Device {
             self.audio_device_id,
             kAudioObjectPropertyScopeInput,
             config.sample_rate,
-            config.channels,
+            config.channels.get(),
             sample_format,
             deadline,
         )
@@ -717,7 +717,7 @@ impl Device {
             self.audio_device_id,
             kAudioObjectPropertyScopeOutput,
             config.sample_rate,
-            config.channels,
+            config.channels.get(),
             sample_format,
             deadline,
         )

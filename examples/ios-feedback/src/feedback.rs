@@ -45,7 +45,7 @@ pub fn run_example() -> Result<(), anyhow::Error> {
 
     // Create a delay in case the input and output devices aren't synced.
     let latency_frames = (LATENCY_MS / 1_000.0) * config.sample_rate as f32;
-    let latency_samples = latency_frames as usize * config.channels as usize;
+    let latency_samples = latency_frames as usize * config.channels.get() as usize;
 
     // The buffer to share samples
     let ring = HeapRb::<f32>::new(latency_samples * 2);

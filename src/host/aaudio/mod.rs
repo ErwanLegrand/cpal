@@ -311,7 +311,7 @@ where
     E: FnMut(Error) + Send + 'static,
 {
     let builder = configure_for_device(builder, device, config);
-    let channel_count = config.channels as i32;
+    let channel_count = config.channels.get() as i32;
     let sample_rate = config.sample_rate;
 
     let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
@@ -408,7 +408,7 @@ where
     E: FnMut(Error) + Send + 'static,
 {
     let builder = configure_for_device(builder, device, config);
-    let channel_count = config.channels as i32;
+    let channel_count = config.channels.get() as i32;
     let sample_rate = config.sample_rate;
     let tune_dynamically = config.buffer_size == BufferSize::Default;
 
@@ -693,7 +693,7 @@ impl DeviceTrait for Device {
         };
         let builder = ndk::audio::AudioStreamBuilder::new()?
             .direction(ndk::audio::AudioDirection::Input)
-            .channel_count(config.channels as i32)
+            .channel_count(config.channels.get() as i32)
             .format(format);
 
         // Keep `capture` monotonic: a transient getTimestamp() failure falls back to `now()`
@@ -740,7 +740,7 @@ impl DeviceTrait for Device {
         };
         let builder = ndk::audio::AudioStreamBuilder::new()?
             .direction(ndk::audio::AudioDirection::Output)
-            .channel_count(config.channels as i32)
+            .channel_count(config.channels.get() as i32)
             .format(format);
 
         // Keep `playback` monotonic: a transient getTimestamp() failure falls back to `now()`

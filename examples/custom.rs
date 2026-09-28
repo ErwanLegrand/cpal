@@ -314,7 +314,7 @@ impl Oscillator {
 }
 
 pub fn make_stream(device: &Device, config: StreamConfig) -> Result<Stream, anyhow::Error> {
-    let num_channels = config.channels as usize;
+    let num_channels = config.channels.get() as usize;
     let mut oscillator = Oscillator {
         waveform: Waveform::Sine,
         sample_rate: config.sample_rate as f32,

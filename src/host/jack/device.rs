@@ -1,6 +1,7 @@
 use std::{
     fmt,
     hash::{Hash, Hasher},
+    num::NonZeroU16,
     time::Duration,
 };
 
@@ -276,7 +277,7 @@ impl DeviceTrait for Device {
                 conf.buffer_size,
             )?;
             let mut stream =
-                Stream::new_input(client, conf.channels, data_callback, error_callback)?;
+                Stream::new_input(client, conf.channels.get(), data_callback, error_callback)?;
             if connect_ports_automatically {
                 stream.connect_to_system_inputs()?;
             }
@@ -322,7 +323,7 @@ impl DeviceTrait for Device {
                 conf.buffer_size,
             )?;
             let mut stream =
-                Stream::new_output(client, conf.channels, data_callback, error_callback)?;
+                Stream::new_output(client, conf.channels.get(), data_callback, error_callback)?;
             if connect_ports_automatically {
                 stream.connect_to_system_outputs()?;
             }
@@ -447,14 +448,18 @@ fn validate_duplex_stream_config(
     input_sample_format: SampleFormat,
     output_sample_format: SampleFormat,
 ) -> Result<(), Error> {
-    let per_direction = |channels| StreamConfig {
-        channels,
-        sample_rate: config.sample_rate,
-        buffer_size: config.buffer_size,
+    let per_direction = |channels: ChannelCount| -> Result<StreamConfig, Error> {
+        Ok(StreamConfig {
+            channels: NonZeroU16::new(channels).ok_or_else(|| {
+                Error::with_message(ErrorKind::InvalidInput, "channel count must be at least 1")
+            })?,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        })
     };
-    crate::validate_stream_config(&per_direction(config.input_channels))?;
+    crate::validate_stream_config(&per_direction(config.input_channels)?)?;
     validate_sample_format(input_sample_format)?;
-    crate::validate_stream_config(&per_direction(config.output_channels))?;
+    crate::validate_stream_config(&per_direction(config.output_channels)?)?;
     validate_sample_format(output_sample_format)?;
     Ok(())
 }

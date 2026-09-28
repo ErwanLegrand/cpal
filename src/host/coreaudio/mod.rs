@@ -43,7 +43,7 @@ fn asbd_from_config(
     config: StreamConfig,
     sample_format: SampleFormat,
 ) -> AudioStreamBasicDescription {
-    let n_channels = config.channels as usize;
+    let n_channels = config.channels.get() as usize;
     let sample_rate = config.sample_rate;
     let bytes_per_channel = sample_format.sample_size();
     let bits_per_channel = bytes_per_channel * 8;

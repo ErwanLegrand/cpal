@@ -12,6 +12,7 @@ This guide covers breaking changes requiring code updates. See [CHANGELOG.md](CH
 - [ ] Replace `InputStreamTimestamp`/`OutputStreamTimestamp` with `StreamTimestamp`; `capture`/`playback` is now `device`.
 - [ ] Remove `ErrorKind::Xrun` match arms; read `CallbackInfo::xrun()` instead.
 - [ ] Update `SampleFormat` method calls to use `self` instead of `&self`; methods are now `const`.
+- [ ] Wrap `StreamConfig::channels` values in `NonZeroU16`.
 
 ## 1. `DeviceTrait` and `StreamTrait` require `Send + Sync`
 
@@ -116,6 +117,35 @@ formats.retain(|f| f.is_int());
 **Why:** `SampleFormat` is a simple enum, there was no reason why it shouldn't be const-friendly, and since every method was both `inline` and it implements `Copy`, there is no performance downside to it taking `self`, but simply more legible than dereferencing.
 
 [`SampleFormat`]: https://docs.rs/cpal/latest/cpal/enum.SampleFormat.html
+
+## 6. `StreamConfig::channels` is now `NonZeroU16`
+
+**What changed:** `StreamConfig::channels` changed from `ChannelCount` (`u16`) to [`NonZeroU16`]. Zero channels is now unrepresentable, so a hand-built `StreamConfig` can no longer describe a zero-channel stream, and the runtime check that rejected one is gone.
+
+```rust
+// Before (v0.18)
+let config = StreamConfig {
+    channels: 2,
+    sample_rate: 44_100,
+    buffer_size: BufferSize::Default,
+};
+
+// After (v0.19)
+use std::num::NonZeroU16;
+
+let config = StreamConfig {
+    channels: NonZeroU16::new(2).unwrap(),
+    sample_rate: 44_100,
+    buffer_size: BufferSize::Default,
+};
+```
+
+**Impact:** Wrap literal or computed channel counts in `NonZeroU16::new(..)`; use [`NonZeroU16::MIN`] for mono. Reading the field yields a `NonZeroU16`, so use `.get()` where a `u16` is needed. `SupportedStreamConfig` and its accessors are unchanged, so code that obtains its config through `SupportedStreamConfig::config()` or `.into()` needs no change. On `wasm32` with the `wasm-bindgen` feature, `channels` is no longer exposed as a JavaScript field: `wasm_bindgen` has no ABI for `NonZeroU16`.
+
+**Why:** Zero channels is invalid on every backend, unlike the other `StreamConfig` limits, which are backend- and device-specific. It is therefore the one channel limit a type can express, and encoding it removes a runtime failure mode rather than reporting it.
+
+[`NonZeroU16`]: https://doc.rust-lang.org/std/num/type.NonZeroU16.html
+[`NonZeroU16::MIN`]: https://doc.rust-lang.org/std/num/type.NonZeroU16.html#associatedconstant.MIN
 ---
 
 # Upgrading from v0.17 to v0.18

@@ -132,7 +132,7 @@ pub fn make_stream<T>(device: &Device, config: StreamConfig) -> Result<Stream, a
 where
     T: SizedSample + FromSample<f32>,
 {
-    let num_channels = config.channels as usize;
+    let num_channels = config.channels.get() as usize;
     let mut oscillator = Oscillator {
         waveform: Waveform::Sine,
         sample_rate: config.sample_rate as f32,

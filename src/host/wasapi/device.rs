@@ -3,6 +3,7 @@ use std::{
     fmt,
     hash::Hash,
     mem,
+    num::NonZeroU16,
     os::windows::ffi::OsStringExt,
     ptr, slice,
     sync::{
@@ -712,7 +713,8 @@ impl Device {
                 for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
                     if let Some(waveformat) = config_to_waveformatextensible(
                         StreamConfig {
-                            channels: format.channels,
+                            channels: NonZeroU16::new(format.channels)
+                                .expect("a device mix format reports at least one channel"),
                             sample_rate,
                             buffer_size: BufferSize::Default,
                         },
@@ -1378,7 +1380,7 @@ fn config_to_waveformatextensible(
 
         _ => return None,
     };
-    let channels = config.channels;
+    let channels = config.channels.get();
     let sample_rate = config.sample_rate;
     let sample_bytes = sample_format.sample_size() as u16;
     let avg_bytes_per_sec = u32::from(channels) * sample_rate * u32::from(sample_bytes);

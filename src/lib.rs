@@ -252,6 +252,8 @@ pub type OutputDevices<I> = DevicesFiltered<I>;
 /// Number of channels.
 pub type ChannelCount = u16;
 
+use std::num::NonZeroU16;
+
 /// The number of samples processed per second for a single channel of audio.
 pub type SampleRate = u32;
 
@@ -483,7 +485,19 @@ impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
 )]
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub struct StreamConfig {
-    pub channels: ChannelCount,
+    /// The number of channels. Zero channels is unrepresentable.
+    ///
+    /// Not exposed to JavaScript: `wasm_bindgen` has no ABI for `NonZeroU16`
+    /// and the orphan rule forbids implementing one here.
+    #[cfg_attr(
+        all(
+            target_arch = "wasm32",
+            any(target_os = "emscripten", target_os = "unknown"),
+            feature = "wasm-bindgen"
+        ),
+        wasm_bindgen(skip)
+    )]
+    pub channels: NonZeroU16,
     pub sample_rate: SampleRate,
     pub buffer_size: BufferSize,
 }
@@ -593,7 +607,8 @@ impl SupportedStreamConfig {
 
     pub fn config(&self) -> StreamConfig {
         StreamConfig {
-            channels: self.channels,
+            channels: NonZeroU16::new(self.channels)
+                .expect("a supported stream config always has at least one channel"),
             sample_rate: self.sample_rate,
             buffer_size: BufferSize::Default,
         }
@@ -904,12 +919,6 @@ impl From<SupportedStreamConfig> for StreamConfig {
 
 #[allow(dead_code)]
 pub(crate) fn validate_stream_config(config: &StreamConfig) -> Result<(), Error> {
-    if config.channels == 0 {
-        return Err(Error::with_message(
-            ErrorKind::InvalidInput,
-            "channel count must be at least 1",
-        ));
-    }
     if config.sample_rate == 0 {
         return Err(Error::with_message(
             ErrorKind::InvalidInput,
@@ -1076,21 +1085,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_stream_config_rejects_zero_channels() {
-        let err = validate_stream_config(&StreamConfig {
-            channels: 0,
-            sample_rate: 44100,
-            buffer_size: BufferSize::Default,
-        })
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        assert!(err.message().unwrap().contains("channel"));
-    }
-
-    #[test]
     fn validate_stream_config_rejects_zero_sample_rate() {
         let err = validate_stream_config(&StreamConfig {
-            channels: 2,
+            channels: NonZeroU16::new(2).unwrap(),
             sample_rate: 0,
             buffer_size: BufferSize::Default,
         })
@@ -1102,7 +1099,7 @@ mod tests {
     #[test]
     fn validate_stream_config_rejects_fixed_buffer_zero() {
         let err = validate_stream_config(&StreamConfig {
-            channels: 2,
+            channels: NonZeroU16::new(2).unwrap(),
             sample_rate: 44100,
             buffer_size: BufferSize::Fixed(0),
         })
@@ -1115,7 +1112,7 @@ mod tests {
     fn validate_stream_config_accepts_valid_configs() {
         assert!(
             validate_stream_config(&StreamConfig {
-                channels: 2,
+                channels: NonZeroU16::new(2).unwrap(),
                 sample_rate: 44100,
                 buffer_size: BufferSize::Default,
             })
@@ -1123,7 +1120,7 @@ mod tests {
         );
         assert!(
             validate_stream_config(&StreamConfig {
-                channels: 1,
+                channels: NonZeroU16::new(1).unwrap(),
                 sample_rate: 1,
                 buffer_size: BufferSize::Fixed(1),
             })

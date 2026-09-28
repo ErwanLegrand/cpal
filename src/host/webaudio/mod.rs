@@ -10,6 +10,7 @@ extern crate web_sys;
 use std::sync::atomic::AtomicU64;
 use std::{
     fmt,
+    num::NonZeroU16,
     ops::DerefMut,
     sync::{Arc, Mutex, RwLock, atomic::Ordering},
     time::Duration,
@@ -314,7 +315,7 @@ impl DeviceTrait for Device {
         main_thread::try_run(|| {
             validate_config(&config, sample_format)?;
 
-            let n_channels = config.channels as usize;
+            let n_channels = config.channels.get() as usize;
 
             let buffer_size_frames = script_processor_buffer_size(config.buffer_size)?;
             let buffer_duration_secs =
@@ -577,7 +578,7 @@ impl DeviceTrait for Device {
         main_thread::try_run(|| {
             validate_config(&config, sample_format)?;
 
-            let n_channels = config.channels as usize;
+            let n_channels = config.channels.get() as usize;
 
             let buffer_size_frames = match config.buffer_size {
                 BufferSize::Fixed(v) => v as usize,
@@ -617,7 +618,7 @@ impl DeviceTrait for Device {
 
             let destination = ctx.destination();
 
-            if config.channels as u32 > destination.max_channel_count() {
+            if config.channels.get() as u32 > destination.max_channel_count() {
                 return Err(Error::with_message(
                     ErrorKind::UnsupportedConfig,
                     format!(
@@ -627,7 +628,7 @@ impl DeviceTrait for Device {
                     ),
                 ));
             }
-            destination.set_channel_count(config.channels as u32);
+            destination.set_channel_count(config.channels.get() as u32);
 
             // SAFETY: AudioContext and Closure are not Send/Sync. In the non-atomics path WASM is
             // single-threaded so there are no thread boundaries to cross. In the atomics path these
@@ -684,7 +685,7 @@ impl DeviceTrait for Device {
                 // Create a webaudio buffer which will be reused to avoid allocations.
                 let ctx_buffer = ctx
                     .create_buffer(
-                        config.channels as u32,
+                        config.channels.get() as u32,
                         buffer_size_frames as u32,
                         config.sample_rate as f32,
                     )
@@ -1042,7 +1043,8 @@ impl DeviceTrait for Device {
             let capture_weak = Rc::downgrade(&capture);
             #[cfg(not(target_feature = "atomics"))]
             let stream_config = StreamConfig {
-                channels: config.output_channels,
+                channels: NonZeroU16::new(config.output_channels)
+                    .expect("`validate_duplex_config` rejected zero channels above"),
                 sample_rate: config.sample_rate,
                 buffer_size: config.buffer_size,
             };
@@ -1464,7 +1466,7 @@ impl Iterator for Devices {
 /// input) and stays in each caller.
 fn validate_config(config: &StreamConfig, sample_format: SampleFormat) -> Result<(), Error> {
     crate::validate_stream_config(config)?;
-    if config.channels > MAX_CHANNELS {
+    if config.channels.get() > MAX_CHANNELS {
         return Err(Error::with_message(
             ErrorKind::UnsupportedConfig,
             format!(
@@ -1516,13 +1518,20 @@ fn validate_duplex_config(
     input_sample_format: SampleFormat,
     output_sample_format: SampleFormat,
 ) -> Result<(), Error> {
-    let per_direction = |channels| StreamConfig {
-        channels,
-        sample_rate: config.sample_rate,
-        buffer_size: config.buffer_size,
+    let per_direction = |channels: ChannelCount| -> Result<StreamConfig, Error> {
+        Ok(StreamConfig {
+            channels: NonZeroU16::new(channels).ok_or_else(|| {
+                Error::with_message(ErrorKind::InvalidInput, "channel count must be at least 1")
+            })?,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        })
     };
-    validate_config(&per_direction(config.input_channels), input_sample_format)?;
-    validate_config(&per_direction(config.output_channels), output_sample_format)
+    validate_config(&per_direction(config.input_channels)?, input_sample_format)?;
+    validate_config(
+        &per_direction(config.output_channels)?,
+        output_sample_format,
+    )
 }
 
 /// The full matrix of channel counts x sample rates for a given buffer-size range.

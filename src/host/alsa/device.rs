@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    num::NonZeroU16,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
     vec::IntoIter as VecIntoIter,
@@ -195,7 +196,7 @@ impl Device {
         let (creation_ts, timestamp_mode) = creation_timestamp(&handle, hw_params)?;
 
         let period_size = period_size as usize;
-        let frame_size = frame_size(sample_format, conf.channels);
+        let frame_size = frame_size(sample_format, conf.channels.get());
 
         let stream_inner = StreamInner {
             control: WorkerControl::default(),
@@ -205,7 +206,7 @@ impl Device {
             sample_rate: conf.sample_rate,
             frame_size,
             period_size,
-            period_samples: period_size * conf.channels as usize,
+            period_samples: period_size * conf.channels.get() as usize,
             equilibrium: (stream_type == alsa::Direction::Playback)
                 .then(|| EquilibriumFill::new(sample_format, period_size * frame_size)),
             timestamp_mode,
@@ -227,16 +228,17 @@ impl Device {
         input_sample_format: SampleFormat,
         output_sample_format: SampleFormat,
     ) -> Result<DuplexStreamInner, Error> {
-        let capture_config = StreamConfig {
-            channels: config.input_channels,
-            sample_rate: config.sample_rate,
-            buffer_size: config.buffer_size,
+        let per_direction = |channels: ChannelCount| -> Result<StreamConfig, Error> {
+            Ok(StreamConfig {
+                channels: NonZeroU16::new(channels).ok_or_else(|| {
+                    Error::with_message(ErrorKind::InvalidInput, "channel count must be at least 1")
+                })?,
+                sample_rate: config.sample_rate,
+                buffer_size: config.buffer_size,
+            })
         };
-        let playback_config = StreamConfig {
-            channels: config.output_channels,
-            sample_rate: config.sample_rate,
-            buffer_size: config.buffer_size,
-        };
+        let capture_config = per_direction(config.input_channels)?;
+        let playback_config = per_direction(config.output_channels)?;
         crate::validate_stream_config(&capture_config)?;
         crate::validate_stream_config(&playback_config)?;
 

@@ -176,7 +176,7 @@ impl Device {
             ));
         }
 
-        let num_channels = config.channels;
+        let num_channels = config.channels.get();
         let buffer_size = self.get_or_create_input_stream(&driver, config, sample_format)?;
         let cpal_num_samples = buffer_size * num_channels as usize;
 
@@ -534,7 +534,7 @@ impl Device {
             ));
         }
 
-        let num_channels = config.channels;
+        let num_channels = config.channels.get();
         let buffer_size = self.get_or_create_output_stream(&driver, config, sample_format)?;
         let cpal_num_samples = buffer_size * num_channels as usize;
 
@@ -918,7 +918,7 @@ impl Device {
     ) -> Result<usize, Error> {
         let num_asio_channels = self.default_input_config()?.channels;
         check_config(driver, config, sample_format, num_asio_channels)?;
-        let num_channels = config.channels as usize;
+        let num_channels = config.channels.get() as usize;
         let asio_streams = driver.streams();
         let mut streams = asio_streams.lock().map_err(|_| {
             Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
@@ -961,7 +961,7 @@ impl Device {
     ) -> Result<usize, Error> {
         let num_asio_channels = self.default_output_config()?.channels;
         check_config(driver, config, sample_format, num_asio_channels)?;
-        let num_channels = config.channels as usize;
+        let num_channels = config.channels.get() as usize;
         let asio_streams = driver.streams();
         let mut streams = asio_streams.lock().map_err(|_| {
             Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
@@ -1239,7 +1239,7 @@ fn check_config(
             ));
         }
     }
-    if channels > num_asio_channels {
+    if channels.get() > num_asio_channels {
         return Err(Error::with_message(
             ErrorKind::UnsupportedConfig,
             format!("Channel count {channels} exceeds the maximum of {num_asio_channels}"),

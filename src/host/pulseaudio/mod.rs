@@ -339,7 +339,7 @@ impl DeviceTrait for Device {
         })?;
 
         if let BufferSize::Fixed(frame_count) = config.buffer_size {
-            let bytes_per_frame = config.channels as usize * sample_format.sample_size();
+            let bytes_per_frame = config.channels.get() as usize * sample_format.sample_size();
             let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / bytes_per_frame) as FrameCount;
             if !(1..=max_frames).contains(&frame_count) {
                 return Err(Error::with_message(
@@ -432,7 +432,7 @@ impl DeviceTrait for Device {
         })?;
 
         if let BufferSize::Fixed(frame_count) = config.buffer_size {
-            let bytes_per_frame = config.channels as usize * sample_format.sample_size();
+            let bytes_per_frame = config.channels.get() as usize * sample_format.sample_size();
             // Playback uses a double-buffer (max_length = 2 × frame_count × bytes_per_frame),
             // so the max period that fits in MAX_MEMBLOCKQ_LENGTH is halved.
             let max_frames = (protocol::MAX_MEMBLOCKQ_LENGTH / (2 * bytes_per_frame)) as FrameCount;
@@ -528,7 +528,7 @@ fn make_sample_spec(config: StreamConfig, format: protocol::SampleFormat) -> pro
     protocol::SampleSpec {
         format,
         sample_rate: config.sample_rate,
-        channels: config.channels as _,
+        channels: config.channels.get() as _,
     }
 }
 
@@ -539,7 +539,7 @@ fn make_channel_map(config: StreamConfig) -> protocol::ChannelMap {
     // (PA_CHANNEL_MAP_DEFAULT) for 1-8 channels, and common Atmos height-
     // channel conventions for 10 and 12 channels. Counts without a widely
     // agreed layout (9, 11, >12) fall back to sequential Aux positions.
-    let standard: &[protocol::ChannelPosition] = match config.channels {
+    let standard: &[protocol::ChannelPosition] = match config.channels.get() {
         1 => &[Mono],
         2 => &[FrontLeft, FrontRight],
         3 => &[FrontLeft, FrontRight, FrontCenter],
@@ -605,7 +605,7 @@ fn make_channel_map(config: StreamConfig) -> protocol::ChannelMap {
         Aux14, Aux15, Aux16, Aux17, Aux18, Aux19, Aux20, Aux21, Aux22, Aux23, Aux24, Aux25, Aux26,
         Aux27, Aux28, Aux29, Aux30, Aux31,
     ];
-    protocol::ChannelMap::new(aux.iter().copied().take(config.channels as usize))
+    protocol::ChannelMap::new(aux.iter().copied().take(config.channels.get() as usize))
 }
 
 fn make_playback_buffer_attr(
@@ -615,9 +615,10 @@ fn make_playback_buffer_attr(
     match config.buffer_size {
         BufferSize::Default => Default::default(),
         BufferSize::Fixed(frame_count) => {
-            let len =
-                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
-                    .min(u32::MAX as u64) as u32;
+            let len = (frame_count as u64
+                * config.channels.get() as u64
+                * format.bytes_per_sample() as u64)
+                .min(u32::MAX as u64) as u32;
             let double_len = (len as u64 * 2).min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // Double-buffer: total buffer = 2 callback periods. With
@@ -640,9 +641,10 @@ fn make_record_buffer_attr(
     match config.buffer_size {
         BufferSize::Default => Default::default(),
         BufferSize::Fixed(frame_count) => {
-            let len =
-                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
-                    .min(u32::MAX as u64) as u32;
+            let len = (frame_count as u64
+                * config.channels.get() as u64
+                * format.bytes_per_sample() as u64)
+                .min(u32::MAX as u64) as u32;
             protocol::stream::BufferAttr {
                 // fragment_size controls the delivery chunk size for record
                 // streams; target_length is playback-only and is ignored here.
