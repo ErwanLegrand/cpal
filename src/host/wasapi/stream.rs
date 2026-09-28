@@ -971,10 +971,23 @@ fn process_commands_and_await_signal(
 /// packet must be released on every path out of processing, including errors and panics.
 struct CapturePacket<'a> {
     capture_client: &'a Audio::IAudioCaptureClient,
+    /// The buffer `GetBuffer` returned, owned here so no raw pointer local can outlive the
+    /// release.
+    buffer: *mut u8,
     frames: u32,
+    geometry: BufferGeometry,
 }
 
 impl CapturePacket<'_> {
+    /// The packet's bytes. Borrowing the guard means the slice cannot outlive it.
+    ///
+    /// Precondition: `frames <= max_frames()`, checked before the frame length is derived.
+    fn bytes(&self) -> &[u8] {
+        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is readable for
+        // `byte_len(frames)` bytes.
+        unsafe { slice::from_raw_parts(self.buffer, self.geometry.byte_len(self.frames)) }
+    }
+
     /// Releases the packet, surfacing the failure that `Drop` would have to swallow.
     fn release(self) -> Result<(), Error> {
         let this = mem::ManuallyDrop::new(self);
@@ -1016,22 +1029,28 @@ fn process_input(
                 Err(err) => return Err(Error::from(err)),
             };
             frames_drained = frames_drained.saturating_add(frames_available);
-            // Re-initialized every packet: the driver need not write the out-params, and a
-            // stale buffer from the previous packet would pass for freshly captured data.
-            let mut buffer: *mut u8 = ptr::null_mut();
             let mut flags: u32 = 0;
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
-            capture_client.GetBuffer(
-                &mut buffer,
-                &mut frames_available,
-                &mut flags,
-                Some(&mut device_position),
-                Some(&mut qpc_position),
-            )?;
-            let packet = CapturePacket {
-                capture_client,
-                frames: frames_available,
+            // The raw pointer is local to this block: the guard takes ownership, so nothing
+            // can touch the buffer except through `packet`.
+            let packet = {
+                // Re-initialized every packet: the driver need not write the out-params, and a
+                // stale buffer from the previous packet would pass for freshly captured data.
+                let mut buffer: *mut u8 = ptr::null_mut();
+                capture_client.GetBuffer(
+                    &mut buffer,
+                    &mut frames_available,
+                    &mut flags,
+                    Some(&mut device_position),
+                    Some(&mut qpc_position),
+                )?;
+                CapturePacket {
+                    capture_client,
+                    buffer,
+                    frames: frames_available,
+                    geometry,
+                }
             };
 
             // An empty packet is reported as `AUDCLNT_S_BUFFER_EMPTY`, a *success* code, so it
@@ -1042,7 +1061,7 @@ fn process_input(
 
             // A non-empty packet without a buffer is a driver bug; fail rather than hand the
             // callback a null buffer.
-            if buffer.is_null() {
+            if packet.buffer.is_null() {
                 return Err(Error::with_message(
                     ErrorKind::BackendError,
                     "IAudioCaptureClient::GetBuffer returned a null buffer for a non-empty packet",
@@ -1080,14 +1099,17 @@ fn process_input(
             } else if geometry.sample_format() == SampleFormat::I24 {
                 // WASAPI stores i24 in the upper bits
                 let sample_count = byte_count / size_of::<i32>();
-                let source_data = slice::from_raw_parts(buffer.cast(), sample_count);
                 // use a scratch buffer since the capture buffer isn't meant to be written.
                 // Bounding the slice first keeps a length error a panic rather than UB;
                 // viewing the i64 words as i32 samples only decreases alignment, so the cast
                 // is sound and the I24 samples stay 4-aligned.
                 let words = &mut scratch_buffer[..sample_count.div_ceil(2)];
+                // Copy through the guard's borrow so the read of the engine-owned buffer stays
+                // tied to the packet's lifetime.
+                let dst_bytes =
+                    slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_count);
+                dst_bytes.copy_from_slice(packet.bytes());
                 let dst = slice::from_raw_parts_mut(words.as_mut_ptr().cast::<i32>(), sample_count);
-                dst.copy_from_slice(source_data);
                 for sample in dst.iter_mut() {
                     // On signed integers, >> is an arithmetic shift,
                     // which ensures the correct upper bits get shifted in
@@ -1096,7 +1118,7 @@ fn process_input(
 
                 dst.as_mut_ptr().cast()
             } else {
-                buffer.cast()
+                packet.bytes().as_ptr().cast_mut().cast()
             };
 
             let len = geometry.sample_len(frames_available);
@@ -1119,15 +1141,32 @@ fn process_input(
 /// packet must be released on every path out of processing, including errors and panics.
 struct RenderPacket<'a> {
     render_client: &'a Audio::IAudioRenderClient,
+    /// The buffer `GetBuffer` returned, owned here so no raw pointer local can outlive the
+    /// release.
+    buffer: *mut u8,
     frames: u32,
+    geometry: BufferGeometry,
 }
 
 impl RenderPacket<'_> {
+    /// The packet's bytes. Borrowing the guard means the slice cannot outlive it.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // Safety: `GetBuffer` succeeded for `frames` frames, so `buffer` is writable for
+        // `byte_len(frames)` bytes.
+        unsafe { slice::from_raw_parts_mut(self.buffer, self.geometry.byte_len(self.frames)) }
+    }
+
     /// Releases the packet, surfacing the failure that `Drop` would have to swallow.
     fn release(self) -> Result<(), Error> {
         let this = mem::ManuallyDrop::new(self);
         unsafe { this.render_client.ReleaseBuffer(this.frames, 0) }
             .context("Failed to release render buffer")
+    }
+
+    /// Release without presenting an unwritten buffer (the old `packet.frames = 0`).
+    fn discard(mut self) -> Result<(), Error> {
+        self.frames = 0;
+        self.release()
     }
 }
 
@@ -1173,23 +1212,22 @@ fn process_output(
 
     unsafe {
         let geometry = stream.geometry;
-        let buffer = render_client.GetBuffer(frames_available)?;
 
         // Bind the packet before the assert: a failed debug assert panics, and the packet's
         // drop is what releases the buffer back to the engine, so it must exist first. The
         // capture side constructs its guard immediately after GetBuffer for the same reason.
         let mut packet = RenderPacket {
             render_client,
+            buffer: render_client.GetBuffer(frames_available)?,
             frames: frames_available,
+            geometry,
         };
 
-        debug_assert!(!buffer.is_null());
+        debug_assert!(!packet.buffer.is_null());
 
-        let byte_count = geometry.byte_len(frames_available);
-        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
-        fill_equilibrium(buffer_slice, geometry.sample_format());
+        fill_equilibrium(packet.bytes_mut(), geometry.sample_format());
 
-        let data = buffer as *mut ();
+        let data = packet.bytes_mut().as_mut_ptr().cast();
         let len = geometry.sample_len(frames_available);
         let mut data = Data::from_parts(data, len, geometry.sample_format());
         let sample_rate = stream.config.sample_rate;
@@ -1197,8 +1235,9 @@ fn process_output(
             match output_timestamp(stream, sample_rate, clock_frequency, *frames_written) {
                 Ok(timestamp) => timestamp,
                 Err(err) => {
-                    // Release the packet without presenting the unwritten buffer.
-                    packet.frames = 0;
+                    // Release the packet without presenting the unwritten buffer. The release
+                    // error is ignored, exactly as the packet's drop would have swallowed it.
+                    let _ = packet.discard();
                     return Err(err);
                 }
             };
@@ -1217,7 +1256,8 @@ fn process_output(
                 clippy::cast_ptr_alignment,
                 reason = "WASAPI guarantees the buffer to be aligned to a frame boundary"
             )]
-            let buffer_slice_i32 = slice::from_raw_parts_mut(buffer.cast::<i32>(), len);
+            let buffer_slice_i32 =
+                slice::from_raw_parts_mut(packet.bytes_mut().as_mut_ptr().cast::<i32>(), len);
             for sample in buffer_slice_i32 {
                 *sample <<= 8;
             }
