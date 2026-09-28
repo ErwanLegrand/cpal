@@ -299,9 +299,10 @@ pub enum PlaybackState {
 // geometry below; an absolute ceiling is required because the requested size is caller-supplied.
 const MAX_BUFFER_BYTES: usize = 1 << 30; // 1 GiB
 
-/// Geometry of the WASAPI ring buffer. Constructing one proves the frame count, the
-/// bytes-per-frame and the sample format are mutually consistent and that every byte length
-/// derived from them fits `usize` and the allocation ceiling.
+/// Geometry of the WASAPI ring buffer. Construction validates the frame count and the
+/// bytes-per-frame so that the byte length of any packet up to `max_frames()` fits `usize` and
+/// stays under the allocation ceiling; `bytes_per_frame` and `sample_format` are then stored, not
+/// cross-checked against each other.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct BufferGeometry {
     max_frames: FrameCount,
@@ -341,12 +342,14 @@ impl BufferGeometry {
         self.sample_format
     }
 
-    /// Bytes occupied by `frames` frames.
+    /// Bytes occupied by `frames` frames. Precondition: `frames <= max_frames()`, which the
+    /// constructor proves keeps the product within `usize`; the multiplication is unchecked.
     pub(crate) fn byte_len(&self, frames: FrameCount) -> usize {
         frames as usize * self.bytes_per_frame as usize
     }
 
-    /// Samples in `frames` frames, matching the `len` a `Data` views.
+    /// Samples in `frames` frames, matching the `len` a `Data` views. Inherits [`Self::byte_len`]'s
+    /// `frames <= max_frames()` precondition.
     pub(crate) fn sample_len(&self, frames: FrameCount) -> usize {
         self.byte_len(frames) / self.sample_format.sample_size()
     }
